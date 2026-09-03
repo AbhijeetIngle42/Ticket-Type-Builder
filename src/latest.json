@@ -1,0 +1,201 @@
+{
+  "_id": {
+    "$oid": "6a3cab15f2fb8f1a140d84d5"
+  },
+  "ticketKey": "Repair & Maintenance",
+  "ticketType": "Repair & Maintenance",
+  "tenantId": "spar",
+  "creators": [
+    {
+      "roleId": "corpadmin"
+    },
+    {
+      "roleId": "smo"
+    }
+  ],
+  "viewers": [
+    {
+      "roleId": "corpadmin"
+    },
+    {
+      "roleId": "rmh"
+    },
+    {
+      "roleId": "smo"
+    }
+  ],
+  "assignee": [
+    {
+      "roleId": "rmh"
+    }
+  ],
+  "deleted": false,
+  "ticketSubType": [
+    {
+      "ticketKey": "Repair & Maintenance",
+      "prefix": "${locationId}-RM",
+      "ticketType": "Repair & Maintenance",
+      "customFieldsMetaData": [
+        {
+          "label": "CIS Ticket Id",
+          "key": "CIS Ticket Id",
+          "type": "text"
+        },
+        {
+          "label": "Start Date",
+          "key": "Start Date",
+          "type": "date"
+        },
+        {
+          "label": "Time required",
+          "key": "Time required",
+          "type": "text"
+        }
+      ],
+      "statusWorkFlow": [
+        {
+          "status": "open",
+          "label": "Open",
+          "public": true,
+          "notification": false
+        },
+        {
+          "status": "Quotes Received",
+          "label": "Quotes Received",
+          "public": false,
+          "roles": [
+            "rmh"
+          ],
+          "notification": false,
+          "customFieldsMetaData": [
+            {
+              "label": "Upload Quote Files (enter 3 quotes)",
+              "key": "uploadImage",
+              "type": "fileUpload"
+            }
+          ]
+        },
+        {
+          "status": "Quote Finalized",
+          "label": "Quote Finalized",
+          "public": false,
+          "roles": [
+            "rmh"
+          ],
+          "notification": false,
+          "customFieldsMetaData": [
+            {
+              "label": "Upload finalized Quote",
+              "key": "uploadImage",
+              "type": "fileUpload"
+            },
+            {
+              "label": "Enter CIS Ticket",
+              "key": "Enter CIS Ticket",
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "status": "PO Created",
+          "label": "PO Created",
+          "public": false,
+          "roles": [
+            "rmh"
+          ],
+          "notification": false
+        },
+        {
+          "status": "Work in Progress",
+          "label": "Work in Progress",
+          "public": false,
+          "roles": [
+            "rmh"
+          ],
+          "notification": false,
+          "customFieldsMetaData": [
+            {
+              "label": "Enter date",
+              "key": "Enter date",
+              "type": "date",
+              "isMandatory": true
+            },
+            {
+              "label": "Enter time requried",
+              "key": "Enter time requried",
+              "type": "number",
+              "isMandatory": true
+            }
+          ]
+        },
+        {
+          "status": "WCR Verified",
+          "label": "WCR Verified",
+          "public": false,
+          "roles": [
+            "rmh"
+          ],
+          "notification": false,
+          "customFieldsMetaData": [
+            {
+              "label": "Upload WCR",
+              "key": "uploadImage",
+              "type": "fileUpload"
+            }
+          ]
+        },
+        {
+          "status": "Work Completed",
+          "label": "Work Completed",
+          "public": false,
+          "roles": [
+            "rmh"
+          ],
+          "notification": false,
+          "customFieldsMetaData": [
+            {
+              "label": "Upload Invoice Signing",
+              "key": "uploadImage",
+              "type": "fileUpload"
+            }
+          ]
+        },
+        {
+          "status": "Payment Done",
+          "label": "Payment Done",
+          "public": false,
+          "roles": [
+            "rmh"
+          ],
+          "notification": false,
+          "customFieldsMetaData": [
+            {
+              "label": "Upload Finance payment status document",
+              "key": "uploadImage",
+              "type": "fileUpload"
+            }
+          ]
+        },
+        {
+          "status": "closed",
+          "label": "Closed",
+          "public": false,
+          "roles": [
+            "rmh"
+          ],
+          "notification": false,
+          "customFieldsMetaData": [
+            {
+              "label": "Repair Cost Tracking & Reporting",
+              "key": "Repair Cost Tracking & Reporting",
+              "type": "text",
+              "isMandatory": true
+            }
+          ]
+        }
+      ],
+      "deleted": false,
+      "isAutoEscalation": false
+    }
+  ]
+}
