@@ -5,7 +5,7 @@ import {
   GripVertical, AlertTriangle, RefreshCw, FileSpreadsheet,
   Sparkles, LayoutTemplate, Star, Wand2, Diff
 } from "lucide-react";
-import * as XLSX from "xlsx-js-style";
+import * as XLSX from "xlsx";
 
 /* ------------------------------------------------------------------ */
 /* utils                                                               */
@@ -1047,41 +1047,6 @@ function excelWorkbookToDocs(wb) {
    sheet format only tracks once per (ticket, status) pair are exported
    from the first sub-type that defines that code within that ticket
    type — a known limitation of the flat-sheet format itself. */
-const XLSX_HEADER_STYLE = {
-  font: { bold: true, color: { rgb: "FFFFFF" } },
-  fill: { fgColor: { rgb: "1F3864" } },
-  alignment: { horizontal: "center", vertical: "center", wrapText: true },
-  border: {
-    top: { style: "thin", color: { rgb: "B8C4DA" } },
-    bottom: { style: "thin", color: { rgb: "B8C4DA" } },
-    left: { style: "thin", color: { rgb: "B8C4DA" } },
-    right: { style: "thin", color: { rgb: "B8C4DA" } },
-  },
-};
-
-/* Applies the workbook's visual theme to a freshly-built sheet: bold white
-   header row on a navy fill, sensible column widths, and an autofilter over
-   the header row. Deliberately skips per-row banding -- some of these
-   sheets run into the thousands of rows (Cascading Dropdowns can exceed
-   4,000), and writing a style object onto every cell would noticeably
-   bloat file size and slow generation for little readability gain on a
-   data-entry sheet like this. Requires "xlsx-js-style" (a SheetJS fork
-   with style-writing support) -- the plain "xlsx" package silently drops
-   cell styles on write, which is why exports looked unstyled before. */
-function styleSheet(ws, numCols) {
-  for (let c = 0; c < numCols; c++) {
-    const ref = XLSX.utils.encode_cell({ r: 0, c });
-    if (ws[ref]) ws[ref].s = XLSX_HEADER_STYLE;
-  }
-  ws["!cols"] = Array.from({ length: numCols }, (_, c) => {
-    const ref = XLSX.utils.encode_cell({ r: 0, c });
-    const headerLen = ws[ref] && ws[ref].v ? String(ws[ref].v).length : 10;
-    return { wch: Math.min(Math.max(headerLen + 4, 14), 34) };
-  });
-  const rowCount = ws["!ref"] ? XLSX.utils.decode_range(ws["!ref"]).e.r + 1 : 1;
-  ws["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowCount - 1, c: numCols - 1 } }) };
-}
-
 function excelWorkbookFromDocs(docs) {
   const wb = XLSX.utils.book_new();
   const skippedFields = [];
@@ -1091,11 +1056,7 @@ function excelWorkbookFromDocs(docs) {
   list.forEach((doc) => {
     detailsRows.push([doc.ticketKey, doc.ticketType, doc.tenantId, doc.creators.join(", "), doc.viewers.join(", "), doc.assignee.join(", "), doc.deleted ? "Yes" : "No"]);
   });
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(detailsRows);
-    styleSheet(ws_, (detailsRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "Ticket Details");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(detailsRows), "Ticket Details");
 
   const subRows = [["Ticket Key", "Ticket Subtype", "Subtype Key", "Prefix", "Assignee Roles", "Auto Escalation", "Delete"]];
   list.forEach((doc) => {
@@ -1103,11 +1064,7 @@ function excelWorkbookFromDocs(docs) {
       subRows.push([doc.ticketKey, s.ticketType, s.ticketKey, s.prefix, (s.assigneeRoles || []).join(", "), s.isAutoEscalation ? "Yes" : "No", s.deleted ? "Yes" : "No"]);
     });
   });
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(subRows);
-    styleSheet(ws_, (subRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "Sub Types");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(subRows), "Sub Types");
 
   const EXCEL_TYPE_LABEL = { dropdown: "dropdown", radio: "radio", multiplechoice: "multichoice", date: "date", time: "time", number: "number", text: "text", fileUpload: "file" };
   const structRows = [["Ticket Key", "Ticket Subtype", "Field (Type)", "Option / Value", "Mandatory", "Edit Roles"]];
@@ -1134,11 +1091,7 @@ function excelWorkbookFromDocs(docs) {
       });
     });
   });
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(structRows);
-    styleSheet(ws_, (structRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "Ticket Structure");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(structRows), "Ticket Structure");
 
   // Matrix fields get their own sheet, laid out to visually mirror the
   // matrix table itself: one block per field, its own columns spelled out
@@ -1159,11 +1112,7 @@ function excelWorkbookFromDocs(docs) {
     matrixRows.push([]);
   });
   if (matrixRows.length <= 1) matrixRows.push(["No matrix fields configured."]);
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(matrixRows);
-    styleSheet(ws_, (matrixRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "Matrix Fields");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(matrixRows), "Matrix Fields");
 
   // Cascading dropdowns: a parent dropdown whose selected option reveals a
   // second ("child") dropdown. Laid out as one block per field, one row per
@@ -1192,11 +1141,7 @@ function excelWorkbookFromDocs(docs) {
     cascadeRows.push([]); // blank row closes this field's block
   });
   if (cascadeRows.length <= 1) cascadeRows.push(["No cascading dropdown fields configured."]);
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(cascadeRows);
-    styleSheet(ws_, (cascadeRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "Cascading Dropdowns");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(cascadeRows), "Cascading Dropdowns");
 
   // API dropdowns: options are fetched live from an endpoint at runtime, so
   // there's nothing to enumerate — just the field's wiring, one row each.
@@ -1207,11 +1152,7 @@ function excelWorkbookFromDocs(docs) {
     apiRows.push([doc.ticketKey, sub.ticketType, field.isMandatory ? "Yes" : "No", (field.editRoles || []).join(", "), `${field.label} (api-dropdown)`, field.labelKey, field.valueKey, field.fillOnSelect ? "Yes" : "No", filtersText]);
   });
   if (apiRows.length <= 1) apiRows.push(["No API dropdown fields configured."]);
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(apiRows);
-    styleSheet(ws_, (apiRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "API Dropdowns");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(apiRows), "API Dropdowns");
 
   const roleRows = [["Ticket Key", "Status", "Roles Allowed"]];
   list.forEach((doc) => {
@@ -1224,11 +1165,7 @@ function excelWorkbookFromDocs(docs) {
     }));
     statusRoles.forEach((v) => roleRows.push([doc.ticketKey, v.label, [...v.roles].join(", ")]));
   });
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(roleRows);
-    styleSheet(ws_, (roleRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "Status Access Roles");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(roleRows), "Status Access Roles");
 
   const mandateRows = [["Ticket Key", "Status", "Mandatory Images", "Mandatory Comments", "Mandatory New Assignee", "New Assignee Role"]];
   list.forEach((doc) => {
@@ -1248,11 +1185,7 @@ function excelWorkbookFromDocs(docs) {
     }));
     mandateMap.forEach((v) => mandateRows.push([doc.ticketKey, v.label, v.images, v.comments, v.newAssignee, v.newAssigneeRole]));
   });
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(mandateRows);
-    styleSheet(ws_, (mandateRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "Mandate rules for status change");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(mandateRows), "Mandate rules for status change");
 
   const escRows = [];
   list.forEach((doc) => {
@@ -1278,11 +1211,7 @@ function excelWorkbookFromDocs(docs) {
     });
   });
   if (!escRows.length) escRows.push(["No auto-escalation rules configured."]);
-  {
-    const ws_ = XLSX.utils.aoa_to_sheet(escRows);
-    styleSheet(ws_, (escRows[0] || []).length);
-    XLSX.utils.book_append_sheet(wb, ws_, "Escalation details");
-  }
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(escRows), "Escalation details");
 
   return { wb, skippedFields };
 }
