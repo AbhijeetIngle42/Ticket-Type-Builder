@@ -1311,6 +1311,7 @@ function templateFromRawJson(raw, name) {
     data: {
       prefix: st.prefix || "",
       isAutoEscalation: st.isAutoEscalation,
+      assigneeRoles: st.assigneeRoles || [],
       customFieldsMetaData: st.customFieldsMetaData,
       statusWorkFlow: st.statusWorkFlow,
     },
@@ -1324,6 +1325,7 @@ function templateDataFromSubType(sub) {
   return {
     prefix: sub.prefix || "",
     isAutoEscalation: !!sub.isAutoEscalation,
+    assigneeRoles: sub.assigneeRoles || [],
     customFieldsMetaData: sub.customFieldsMetaData || [],
     statusWorkFlow: sub.statusWorkFlow || [],
   };
@@ -1341,6 +1343,7 @@ function subTypeFromTemplate(template, name, ticketKey) {
     ticketType: name,
     deleted: false,
     isAutoEscalation: !!cloned.isAutoEscalation,
+    assigneeRoles: cloned.assigneeRoles || [],
     customFieldsMetaData: cloned.customFieldsMetaData || [],
     statusWorkFlow: cloned.statusWorkFlow || [],
   };
