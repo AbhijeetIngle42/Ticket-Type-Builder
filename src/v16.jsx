@@ -1676,7 +1676,7 @@ const Input = ({ value, onChange, placeholder, mono, ...rest }) => (
     value={value}
     onChange={(e) => onChange(e.target.value)}
     placeholder={placeholder}
-    className={`w-full rounded-xl border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 outline-none transition hover:border-white/20 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 ${mono ? "font-mono" : ""}`}
+    className={`w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 ${mono ? "font-mono" : ""}`}
     {...rest}
   />
 );
@@ -1685,7 +1685,7 @@ const Select = ({ value, onChange, options }) => (
   <select
     value={value}
     onChange={(e) => onChange(e.target.value)}
-    className="w-full rounded-xl border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 outline-none transition hover:border-white/20 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20"
+    className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20"
   >
     {options.map((o) => (
       <option key={o.value} value={o.value}>{o.label}</option>
@@ -1703,7 +1703,7 @@ const Toggle = ({ checked, onChange, label }) => (
   >
     <span
       className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full border transition-colors ${
-        checked ? "border-indigo-400 bg-indigo-400" : "border-white/15 bg-slate-800"
+        checked ? "border-indigo-500 bg-indigo-500" : "border-white/15 bg-slate-800"
       } group-focus-visible:ring-2 group-focus-visible:ring-indigo-400/40 group-focus-visible:ring-offset-2 group-focus-visible:ring-offset-[#0B0F1C]`}
     >
       <span
@@ -1727,12 +1727,12 @@ const IconBtn = ({ onClick, title, danger, children }) => (
 );
 
 const Btn = ({ onClick, children, variant = "primary", small }) => {
-  const base = "inline-flex items-center gap-1.5 rounded-xl font-medium transition active:scale-[0.97]";
+  const base = "inline-flex items-center gap-1.5 rounded-lg font-medium transition";
   const size = small ? "px-2.5 py-1.5 text-xs" : "px-3.5 py-2 text-sm";
   const styles = {
     primary: "bg-slate-100 text-slate-900 hover:bg-white",
-    accent: "bg-gradient-to-b from-indigo-400 to-indigo-500 text-white shadow-md shadow-indigo-500/20 hover:from-indigo-300 hover:to-indigo-400 hover:shadow-indigo-400/30",
-    ghost: "bg-transparent text-slate-300 hover:bg-white/5 hover:border-white/20 border border-white/10",
+    accent: "bg-indigo-600 text-white hover:bg-indigo-500",
+    ghost: "bg-transparent text-slate-300 hover:bg-white/5 border border-white/10",
     dashed: "border border-dashed border-white/15 text-slate-500 hover:border-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/5",
   };
   return (
@@ -1791,7 +1791,7 @@ const CheckChips = ({ options, values, onChange }) => (
           key={o}
           type="button"
           onClick={() => onChange(active ? values.filter((v) => v !== o) : [...values, o])}
-          className={`rounded-md px-2.5 py-1 text-xs font-mono border transition ${active ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-500 hover:border-white/25"}`}
+          className={`rounded-md px-2.5 py-1 text-xs font-mono border transition ${active ? "border-indigo-500 bg-indigo-500 text-white" : "border-white/10 text-slate-500 hover:border-white/25"}`}
         >
           {o}
         </button>
@@ -1926,7 +1926,7 @@ function CascadeOptionsEditor({ field, onChange }) {
               key={t}
               type="button"
               onClick={() => onChange({ ...field, parentOptionType: t })}
-              className={`px-2.5 py-1 rounded-md text-xs font-mono border ${field.parentOptionType === t ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-500"}`}
+              className={`px-2.5 py-1 rounded-md text-xs font-mono border ${field.parentOptionType === t ? "border-indigo-500 bg-indigo-500 text-white" : "border-white/10 text-slate-500"}`}
             >
               {t}
             </button>
@@ -2301,7 +2301,7 @@ function StatusPipelinePreview({ statuses }) {
         {statuses.map((s, i) => (
           <React.Fragment key={s.id}>
             <div className="flex flex-col items-center px-1">
-              <div className={`h-2.5 w-2.5 rounded-full ${s.status ? "bg-indigo-400" : "bg-slate-700"}`} />
+              <div className={`h-2.5 w-2.5 rounded-full ${s.status ? "bg-indigo-500" : "bg-slate-700"}`} />
               <div className="mt-1.5 text-[11px] font-mono text-slate-500 whitespace-nowrap">{s.label || s.status || "…"}</div>
             </div>
             {i < statuses.length - 1 && <div className="h-px w-8 bg-slate-200 mb-4" />}
@@ -2508,7 +2508,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
                 type="button"
                 onClick={() => templates.length && setSourceKind("template")}
                 disabled={!templates.length}
-                className={`px-2.5 py-1.5 rounded-md text-xs font-medium border transition ${sourceKind === "template" ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-400"} ${!templates.length ? "opacity-40 cursor-not-allowed" : ""}`}
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium border transition ${sourceKind === "template" ? "border-indigo-500 bg-indigo-500 text-white" : "border-white/10 text-slate-400"} ${!templates.length ? "opacity-40 cursor-not-allowed" : ""}`}
               >
                 Saved template
               </button>
@@ -2516,7 +2516,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
                 type="button"
                 onClick={() => subtypeOptions.length && setSourceKind("subtype")}
                 disabled={!subtypeOptions.length}
-                className={`px-2.5 py-1.5 rounded-md text-xs font-medium border transition ${sourceKind === "subtype" ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-400"} ${!subtypeOptions.length ? "opacity-40 cursor-not-allowed" : ""}`}
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium border transition ${sourceKind === "subtype" ? "border-indigo-500 bg-indigo-500 text-white" : "border-white/10 text-slate-400"} ${!subtypeOptions.length ? "opacity-40 cursor-not-allowed" : ""}`}
               >
                 Existing sub-type
               </button>
@@ -2601,7 +2601,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
                         <button
                           type="button"
                           onClick={() => setReviewChoices((c) => ({ ...c, [d.name]: true }))}
-                          className={`px-2 py-1 rounded text-xs font-medium border transition ${willUpdate ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-500"}`}
+                          className={`px-2 py-1 rounded text-xs font-medium border transition ${willUpdate ? "border-indigo-500 bg-indigo-500 text-white" : "border-white/10 text-slate-500"}`}
                         >
                           Update
                         </button>
@@ -3744,10 +3744,7 @@ export default function App({ initialData } = {}) {
   };
 
   return (
-    <div
-      className="min-h-screen bg-[#070A13] bg-[radial-gradient(ellipse_90%_50%_at_50%_-10%,rgba(129,140,248,0.14),rgba(7,10,19,0)_60%)] flex text-slate-200"
-      style={{ fontFamily: "Inter, ui-sans-serif, system-ui" }}
-    >
+    <div className="min-h-screen bg-[#070A13] flex text-slate-200" style={{ fontFamily: "Inter, ui-sans-serif, system-ui" }}>
       {/* sidebar */}
       <aside className="w-60 shrink-0 bg-[#050710] text-slate-300 flex flex-col border-r border-white/5">
         <div className="px-5 py-5 border-b border-white/5">
@@ -3765,7 +3762,7 @@ export default function App({ initialData } = {}) {
                 key={n.id}
                 onClick={() => !disabled && setTab(n.id)}
                 disabled={disabled}
-                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition ${tab === n.id ? "bg-indigo-400/15 text-indigo-200 shadow-[inset_0_0_0_1px_rgba(129,140,248,0.25)]" : disabled ? "text-slate-700 cursor-not-allowed" : "hover:bg-white/5 text-slate-400"}`}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm transition ${tab === n.id ? "bg-indigo-500/10 text-indigo-300" : disabled ? "text-slate-700 cursor-not-allowed" : "hover:bg-white/5 text-slate-400"}`}
               >
                 {n.icon}
                 {n.label}

@@ -1662,12 +1662,9 @@ function diffDocsToOps(oldDoc, newDoc) {
 /* tiny UI primitives                                                  */
 /* ------------------------------------------------------------------ */
 
-const Label = ({ children, mono, hint }) => (
-  <label className="block mb-1.5">
-    <span className={`block text-[11px] font-semibold uppercase tracking-wider text-slate-400 ${mono ? "font-mono normal-case tracking-normal" : ""}`}>
-      {children}
-    </span>
-    {hint && <span className="block text-[11px] font-normal normal-case tracking-normal text-slate-600 mt-0.5">{hint}</span>}
+const Label = ({ children, mono }) => (
+  <label className={`block text-[11px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5 ${mono ? "font-mono normal-case tracking-normal" : ""}`}>
+    {children}
   </label>
 );
 
@@ -1676,7 +1673,7 @@ const Input = ({ value, onChange, placeholder, mono, ...rest }) => (
     value={value}
     onChange={(e) => onChange(e.target.value)}
     placeholder={placeholder}
-    className={`w-full rounded-xl border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 outline-none transition hover:border-white/20 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 ${mono ? "font-mono" : ""}`}
+    className={`w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 placeholder:text-slate-600 outline-none transition focus:border-teal-400 focus:ring-2 focus:ring-teal-400/20 ${mono ? "font-mono" : ""}`}
     {...rest}
   />
 );
@@ -1685,7 +1682,7 @@ const Select = ({ value, onChange, options }) => (
   <select
     value={value}
     onChange={(e) => onChange(e.target.value)}
-    className="w-full rounded-xl border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 outline-none transition hover:border-white/20 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20"
+    className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-teal-400 focus:ring-2 focus:ring-teal-400/20"
   >
     {options.map((o) => (
       <option key={o.value} value={o.value}>{o.label}</option>
@@ -1696,22 +1693,13 @@ const Select = ({ value, onChange, options }) => (
 const Toggle = ({ checked, onChange, label }) => (
   <button
     type="button"
-    role="switch"
-    aria-checked={checked}
     onClick={() => onChange(!checked)}
-    className="group flex items-center gap-3 text-sm text-slate-300 outline-none"
+    className="flex items-center gap-2 text-sm text-slate-300"
   >
-    <span
-      className={`relative inline-flex h-6 w-10 shrink-0 items-center rounded-full border transition-colors ${
-        checked ? "border-indigo-400 bg-indigo-400" : "border-white/15 bg-slate-800"
-      } group-focus-visible:ring-2 group-focus-visible:ring-indigo-400/40 group-focus-visible:ring-offset-2 group-focus-visible:ring-offset-[#0B0F1C]`}
-    >
-      <span
-        className="inline-block h-4 w-4 transform rounded-full bg-white shadow-sm transition-transform duration-150"
-        style={{ transform: checked ? "translateX(18px)" : "translateX(2px)" }}
-      />
+    <span className={`relative inline-flex h-5 w-9 items-center rounded-full transition ${checked ? "bg-teal-500" : "bg-slate-700"}`}>
+      <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition ${checked ? "translate-x-4.5" : "translate-x-1"}`} style={{ transform: checked ? "translateX(18px)" : "translateX(4px)" }} />
     </span>
-    <span className="select-none">{label}</span>
+    {label}
   </button>
 );
 
@@ -1727,13 +1715,13 @@ const IconBtn = ({ onClick, title, danger, children }) => (
 );
 
 const Btn = ({ onClick, children, variant = "primary", small }) => {
-  const base = "inline-flex items-center gap-1.5 rounded-xl font-medium transition active:scale-[0.97]";
+  const base = "inline-flex items-center gap-1.5 rounded-lg font-medium transition";
   const size = small ? "px-2.5 py-1.5 text-xs" : "px-3.5 py-2 text-sm";
   const styles = {
     primary: "bg-slate-100 text-slate-900 hover:bg-white",
-    accent: "bg-gradient-to-b from-indigo-400 to-indigo-500 text-white shadow-md shadow-indigo-500/20 hover:from-indigo-300 hover:to-indigo-400 hover:shadow-indigo-400/30",
-    ghost: "bg-transparent text-slate-300 hover:bg-white/5 hover:border-white/20 border border-white/10",
-    dashed: "border border-dashed border-white/15 text-slate-500 hover:border-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/5",
+    accent: "bg-teal-600 text-white hover:bg-teal-500",
+    ghost: "bg-transparent text-slate-300 hover:bg-white/5 border border-white/10",
+    dashed: "border border-dashed border-white/15 text-slate-500 hover:border-teal-400 hover:text-teal-300 hover:bg-teal-500/5",
   };
   return (
     <button type="button" onClick={onClick} className={`${base} ${size} ${styles[variant]}`}>
@@ -1745,7 +1733,7 @@ const Btn = ({ onClick, children, variant = "primary", small }) => {
 const Chip = ({ text, onRemove, tone = "slate" }) => {
   const tones = {
     slate: "bg-white/5 text-slate-300",
-    indigo: "bg-indigo-500/10 text-indigo-300",
+    teal: "bg-teal-500/10 text-teal-300",
     amber: "bg-amber-500/10 text-amber-300",
   };
   return (
@@ -1791,7 +1779,7 @@ const CheckChips = ({ options, values, onChange }) => (
           key={o}
           type="button"
           onClick={() => onChange(active ? values.filter((v) => v !== o) : [...values, o])}
-          className={`rounded-md px-2.5 py-1 text-xs font-mono border transition ${active ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-500 hover:border-white/25"}`}
+          className={`rounded-md px-2.5 py-1 text-xs font-mono border transition ${active ? "border-teal-500 bg-teal-500 text-white" : "border-white/10 text-slate-500 hover:border-white/25"}`}
         >
           {o}
         </button>
@@ -1818,9 +1806,9 @@ const Section = ({ title, icon, children, onAdd, addLabel, right }) => (
 const Accordion = ({ title, subtitle, tone = "slate", defaultOpen, forceOpen, domId, onDelete, children }) => {
   const [open, setOpen] = useState(!!defaultOpen);
   React.useEffect(() => { if (forceOpen) setOpen(true); }, [forceOpen]);
-  const tones = { slate: "border-white/10", indigo: "border-indigo-500/30", amber: "border-amber-500/30" };
+  const tones = { slate: "border-white/10", teal: "border-teal-500/30", amber: "border-amber-500/30" };
   return (
-    <div id={domId} className={`rounded-xl border ${tones[tone]} bg-[#111528] mb-3 overflow-hidden ${forceOpen ? "ring-2 ring-indigo-400/40" : ""}`}>
+    <div id={domId} className={`rounded-xl border ${tones[tone]} bg-[#111528] mb-3 overflow-hidden ${forceOpen ? "ring-2 ring-teal-400/40" : ""}`}>
       <div className="flex items-center justify-between px-3 py-2.5 cursor-pointer select-none" onClick={() => setOpen(!open)}>
         <div className="flex items-center gap-2 min-w-0">
           {open ? <ChevronDown size={16} className="text-slate-400 shrink-0" /> : <ChevronRight size={16} className="text-slate-400 shrink-0" />}
@@ -1869,7 +1857,7 @@ function SimpleOptionsEditor({ options, onChange, allFieldKeys }) {
                   title="Reveal other fields when this option is picked"
                   onClick={() => setOpenId(open ? null : o.id)}
                 >
-                  <ListTree size={14} className={hasCondition ? "text-indigo-400" : ""} />
+                  <ListTree size={14} className={hasCondition ? "text-teal-400" : ""} />
                 </IconBtn>
                 <IconBtn danger title="Remove option" onClick={() => remove(o.id)}><Trash2 size={14} /></IconBtn>
               </div>
@@ -1880,7 +1868,7 @@ function SimpleOptionsEditor({ options, onChange, allFieldKeys }) {
                     values={o.dependentCustomFields || []}
                     onChange={(v) => update(o.id, { dependentCustomFields: v })}
                     placeholder="field key, press enter"
-                    tone="indigo"
+                    tone="teal"
                   />
                 </div>
               )}
@@ -1888,7 +1876,7 @@ function SimpleOptionsEditor({ options, onChange, allFieldKeys }) {
           );
         })}
       </div>
-      <button type="button" onClick={add} className="mt-2 text-xs font-medium text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1">
+      <button type="button" onClick={add} className="mt-2 text-xs font-medium text-teal-400 hover:text-teal-300 inline-flex items-center gap-1">
         <Plus size={13} /> Add option
       </button>
     </div>
@@ -1926,7 +1914,7 @@ function CascadeOptionsEditor({ field, onChange }) {
               key={t}
               type="button"
               onClick={() => onChange({ ...field, parentOptionType: t })}
-              className={`px-2.5 py-1 rounded-md text-xs font-mono border ${field.parentOptionType === t ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-500"}`}
+              className={`px-2.5 py-1 rounded-md text-xs font-mono border ${field.parentOptionType === t ? "border-teal-500 bg-teal-500 text-white" : "border-white/10 text-slate-500"}`}
             >
               {t}
             </button>
@@ -1940,7 +1928,7 @@ function CascadeOptionsEditor({ field, onChange }) {
             <Input mono value={p.key} onChange={(v) => updateParent(p.id, { key: v })} placeholder="key" />
             <IconBtn danger title="Remove parent" onClick={() => removeParent(p.id)}><Trash2 size={14} /></IconBtn>
           </div>
-          <div className="pl-3 border-l-2 border-indigo-500/20 space-y-1.5">
+          <div className="pl-3 border-l-2 border-teal-500/20 space-y-1.5">
             {p.children.map((c) => (
               <div key={c.id} className="grid grid-cols-[1fr_120px_28px] gap-2 items-center">
                 <Input value={c.value} onChange={(v) => updateChild(p.id, c.id, { value: v })} placeholder="Child value, e.g. Buttercup" />
@@ -1948,13 +1936,13 @@ function CascadeOptionsEditor({ field, onChange }) {
                 <IconBtn danger title="Remove child" onClick={() => removeChild(p.id, c.id)}><Trash2 size={14} /></IconBtn>
               </div>
             ))}
-            <button type="button" onClick={() => addChild(p.id)} className="text-xs font-medium text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1 mt-1">
+            <button type="button" onClick={() => addChild(p.id)} className="text-xs font-medium text-teal-400 hover:text-teal-300 inline-flex items-center gap-1 mt-1">
               <Plus size={12} /> Add child option
             </button>
           </div>
         </div>
       ))}
-      <button type="button" onClick={addParent} className="text-xs font-medium text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1">
+      <button type="button" onClick={addParent} className="text-xs font-medium text-teal-400 hover:text-teal-300 inline-flex items-center gap-1">
         <Plus size={13} /> Add parent option
       </button>
     </div>
@@ -1983,14 +1971,14 @@ function MatrixColumnsEditor({ columns, onChange }) {
             <IconBtn danger title="Remove column" onClick={() => remove(c.id)}><Trash2 size={14} /></IconBtn>
           </div>
           {c.type === "dropdown" && (
-            <div className="pl-3 border-l-2 border-indigo-500/20 mb-2">
+            <div className="pl-3 border-l-2 border-teal-500/20 mb-2">
               <SimpleOptionsEditor options={c.options || []} onChange={(opts) => update(c.id, { options: opts })} />
             </div>
           )}
           <Input mono value={c.formula} onChange={(v) => update(c.id, { formula: v })} placeholder="optional formula, e.g. rate*quantity" />
         </div>
       ))}
-      <button type="button" onClick={add} className="text-xs font-medium text-indigo-400 hover:text-indigo-300 inline-flex items-center gap-1">
+      <button type="button" onClick={add} className="text-xs font-medium text-teal-400 hover:text-teal-300 inline-flex items-center gap-1">
         <Plus size={13} /> Add column
       </button>
     </div>
@@ -2026,7 +2014,7 @@ function AdvancedFieldSettings({ field, onChange }) {
           </div>
           <div>
             <Label>Roles who can edit this field</Label>
-            <TagInput values={field.editRoles || []} onChange={(v) => onChange({ ...field, editRoles: v })} placeholder="role id, press enter" tone="indigo" />
+            <TagInput values={field.editRoles || []} onChange={(v) => onChange({ ...field, editRoles: v })} placeholder="role id, press enter" tone="teal" />
           </div>
         </div>
       )}
@@ -2053,11 +2041,11 @@ function CustomFieldEditor({ field, onChange, onDelete, restrictToDropdown }) {
     >
       <div className="grid grid-cols-2 gap-3 mb-3">
         <div>
-          <Label hint="What people see on the form">Field label</Label>
+          <Label>Field label</Label>
           <Input value={field.label} onChange={(v) => onChange({ ...field, label: v })} placeholder="e.g. Division Code" />
         </div>
         <div>
-          <Label mono hint="Internal id this value is stored under — no spaces">Field key</Label>
+          <Label mono>Field key</Label>
           <Input mono value={field.key} onChange={(v) => onChange({ ...field, key: v })} placeholder="e.g. divisionCode" />
         </div>
       </div>
@@ -2111,7 +2099,7 @@ function CustomFieldEditor({ field, onChange, onDelete, restrictToDropdown }) {
             value={field.apiFiltersText}
             onChange={(e) => onChange({ ...field, apiFiltersText: e.target.value })}
             rows={5}
-            className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-xs font-mono text-slate-100 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20"
+            className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-xs font-mono text-slate-100 outline-none focus:border-teal-400 focus:ring-2 focus:ring-teal-400/20"
             placeholder={'{\n  "ticketType": "Customer Acquisition",\n  "status": "closed"\n}'}
           />
         </>
@@ -2218,16 +2206,16 @@ function StatusEditor({ status, onChange, onDelete }) {
     <Accordion
       title={status.label || "(untitled status)"}
       subtitle={status.status || "status-code"}
-      tone="indigo"
+      tone="teal"
       onDelete={onDelete}
     >
       <div className="grid grid-cols-2 gap-3 mb-3">
         <div>
-          <Label mono hint="Internal id used by the workflow engine, no spaces">Status code</Label>
+          <Label mono>Status code</Label>
           <Input mono value={status.status} onChange={(v) => onChange({ ...status, status: v })} placeholder="e.g. open" />
         </div>
         <div>
-          <Label hint="What people see on the ticket">Display label</Label>
+          <Label>Display label</Label>
           <Input value={status.label} onChange={(v) => onChange({ ...status, label: v })} placeholder="e.g. Open" />
         </div>
       </div>
@@ -2247,33 +2235,33 @@ function StatusEditor({ status, onChange, onDelete }) {
       <div className="grid grid-cols-2 gap-3 mb-3">
         <div>
           <Label>Roles allowed to set this status</Label>
-          <TagInput values={status.roles} onChange={(v) => onChange({ ...status, roles: v })} placeholder="e.g. corpadmin" tone="indigo" />
+          <TagInput values={status.roles} onChange={(v) => onChange({ ...status, roles: v })} placeholder="e.g. corpadmin" tone="teal" />
         </div>
         <div>
           <Label>Notify roles</Label>
-          <TagInput values={status.notificationRole} onChange={(v) => onChange({ ...status, notificationRole: v })} placeholder="e.g. Dist_Mgr" tone="indigo" />
+          <TagInput values={status.notificationRole} onChange={(v) => onChange({ ...status, notificationRole: v })} placeholder="e.g. Dist_Mgr" tone="teal" />
         </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3 mb-3">
         <div>
           <Label>Assignee roles at this status</Label>
-          <TagInput values={status.assigneeRoles} onChange={(v) => onChange({ ...status, assigneeRoles: v })} placeholder="e.g. corpadmin" tone="indigo" />
+          <TagInput values={status.assigneeRoles} onChange={(v) => onChange({ ...status, assigneeRoles: v })} placeholder="e.g. corpadmin" tone="teal" />
         </div>
         <div>
-          <Label mono hint="Jump straight to this status code instead, if set">Override status on completion</Label>
+          <Label mono>Override status on completion</Label>
           <Input mono value={status.overrideStatus} onChange={(v) => onChange({ ...status, overrideStatus: v })} placeholder="e.g. closed" />
         </div>
       </div>
 
       <div className="mb-3">
-        <Label hint="Ticket can't move here until these field keys are filled in">Mandatory fields to move into this status</Label>
+        <Label>Mandatory fields to move into this status</Label>
         <TagInput values={status.mandatoryCustomFields} onChange={(v) => onChange({ ...status, mandatoryCustomFields: v })} placeholder="field key, press enter" tone="amber" />
       </div>
 
       <div className="mb-3">
-        <Label mono hint="This status can only be reached after all of these are done">Depends on other status codes</Label>
-        <TagInput values={status.dependentStatus} onChange={(v) => onChange({ ...status, dependentStatus: v })} placeholder="status code, press enter" tone="indigo" />
+        <Label mono>Depends on other status codes</Label>
+        <TagInput values={status.dependentStatus} onChange={(v) => onChange({ ...status, dependentStatus: v })} placeholder="status code, press enter" tone="teal" />
       </div>
 
       <div className="mb-3">
@@ -2301,7 +2289,7 @@ function StatusPipelinePreview({ statuses }) {
         {statuses.map((s, i) => (
           <React.Fragment key={s.id}>
             <div className="flex flex-col items-center px-1">
-              <div className={`h-2.5 w-2.5 rounded-full ${s.status ? "bg-indigo-400" : "bg-slate-700"}`} />
+              <div className={`h-2.5 w-2.5 rounded-full ${s.status ? "bg-teal-500" : "bg-slate-700"}`} />
               <div className="mt-1.5 text-[11px] font-mono text-slate-500 whitespace-nowrap">{s.label || s.status || "…"}</div>
             </div>
             {i < statuses.length - 1 && <div className="h-px w-8 bg-slate-200 mb-4" />}
@@ -2337,7 +2325,7 @@ function SubTypeEditor({ sub, onChange, onDelete, forceOpen }) {
             key={t.id}
             type="button"
             onClick={() => setTab(t.id)}
-            className={`px-3 py-2 text-xs font-medium border-b-2 -mb-px transition ${tab === t.id ? "border-indigo-400 text-indigo-300" : "border-transparent text-slate-500 hover:text-slate-300"}`}
+            className={`px-3 py-2 text-xs font-medium border-b-2 -mb-px transition ${tab === t.id ? "border-teal-400 text-teal-300" : "border-transparent text-slate-500 hover:text-slate-300"}`}
           >
             {t.label}
           </button>
@@ -2348,21 +2336,21 @@ function SubTypeEditor({ sub, onChange, onDelete, forceOpen }) {
         <div>
           <div className="grid grid-cols-2 gap-3 mb-3">
             <div>
-              <Label mono hint="Internal code for this sub-type — used in ticket IDs, no spaces">Sub-type key</Label>
+              <Label mono>Sub-type key</Label>
               <Input mono value={sub.ticketKey} onChange={(v) => onChange({ ...sub, ticketKey: v })} placeholder="e.g. StockGap" />
             </div>
             <div>
-              <Label mono hint="Template for the ticket ID this sub-type generates">Prefix</Label>
+              <Label mono>Prefix</Label>
               <Input mono value={sub.prefix} onChange={(v) => onChange({ ...sub, prefix: v })} placeholder="e.g. ${locationId}" />
             </div>
           </div>
           <div className="mb-3">
-            <Label hint="The display name people see when choosing this sub-type">Sub-type name</Label>
+            <Label>Sub-type name</Label>
             <Input value={sub.ticketType} onChange={(v) => onChange({ ...sub, ticketType: v })} placeholder="e.g. DS Stock gaps in plotted plannos" />
           </div>
           <div className="mb-3">
             <Label>Assignee roles — default routing for this sub-type</Label>
-            <TagInput values={sub.assigneeRoles || []} onChange={(v) => onChange({ ...sub, assigneeRoles: v })} placeholder="e.g. HOHRPayroll — press enter" tone="indigo" />
+            <TagInput values={sub.assigneeRoles || []} onChange={(v) => onChange({ ...sub, assigneeRoles: v })} placeholder="e.g. HOHRPayroll — press enter" tone="teal" />
           </div>
           <div className="flex gap-6">
             <Toggle checked={sub.deleted} onChange={(v) => onChange({ ...sub, deleted: v })} label="Deleted" />
@@ -2486,9 +2474,9 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
   };
 
   return (
-    <div className="rounded-xl border border-indigo-500/30 bg-[#0D1424] p-4 mb-4">
+    <div className="rounded-xl border border-teal-500/30 bg-[#0D1424] p-4 mb-4">
       <div className="flex items-center justify-between mb-3">
-        <div className="flex items-center gap-2 text-sm font-semibold text-indigo-300">
+        <div className="flex items-center gap-2 text-sm font-semibold text-teal-300">
           <Sparkles size={15} /> Bulk create sub-types
         </div>
         <IconBtn onClick={onClose} title="Close"><X size={14} /></IconBtn>
@@ -2496,7 +2484,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
 
       {!hasAnySource ? (
         <p className="text-sm text-slate-400">
-          Nothing to stamp out from yet. Either import a template on the <span className="text-indigo-300 font-medium">Templates</span> tab,
+          Nothing to stamp out from yet. Either import a template on the <span className="text-teal-300 font-medium">Templates</span> tab,
           or add at least one sub-type first (here or on another ticket type) — either can be used as the source shape for bulk creation.
         </p>
       ) : (
@@ -2508,7 +2496,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
                 type="button"
                 onClick={() => templates.length && setSourceKind("template")}
                 disabled={!templates.length}
-                className={`px-2.5 py-1.5 rounded-md text-xs font-medium border transition ${sourceKind === "template" ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-400"} ${!templates.length ? "opacity-40 cursor-not-allowed" : ""}`}
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium border transition ${sourceKind === "template" ? "border-teal-500 bg-teal-500 text-white" : "border-white/10 text-slate-400"} ${!templates.length ? "opacity-40 cursor-not-allowed" : ""}`}
               >
                 Saved template
               </button>
@@ -2516,7 +2504,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
                 type="button"
                 onClick={() => subtypeOptions.length && setSourceKind("subtype")}
                 disabled={!subtypeOptions.length}
-                className={`px-2.5 py-1.5 rounded-md text-xs font-medium border transition ${sourceKind === "subtype" ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-400"} ${!subtypeOptions.length ? "opacity-40 cursor-not-allowed" : ""}`}
+                className={`px-2.5 py-1.5 rounded-md text-xs font-medium border transition ${sourceKind === "subtype" ? "border-teal-500 bg-teal-500 text-white" : "border-white/10 text-slate-400"} ${!subtypeOptions.length ? "opacity-40 cursor-not-allowed" : ""}`}
               >
                 Existing sub-type
               </button>
@@ -2551,7 +2539,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
             value={text}
             onChange={(e) => setText(e.target.value)}
             rows={6}
-            className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 font-mono"
+            className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 outline-none focus:border-teal-400 focus:ring-2 focus:ring-teal-400/20 font-mono"
             placeholder={"DS Stock gaps - Store 101\nDS Stock gaps - Store 102\nDS Stock gaps - Store 103"}
           />
           <p className="text-xs text-slate-600 mt-1.5">
@@ -2568,7 +2556,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
                 <button
                   type="button"
                   onClick={() => setReviewChoices(Object.fromEntries(dupes.map((d) => [d.name, true])))}
-                  className="text-xs font-medium text-indigo-400 hover:text-indigo-300"
+                  className="text-xs font-medium text-teal-400 hover:text-teal-300"
                 >
                   Update all
                 </button>
@@ -2601,7 +2589,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
                         <button
                           type="button"
                           onClick={() => setReviewChoices((c) => ({ ...c, [d.name]: true }))}
-                          className={`px-2 py-1 rounded text-xs font-medium border transition ${willUpdate ? "border-indigo-400 bg-indigo-400 text-white" : "border-white/10 text-slate-500"}`}
+                          className={`px-2 py-1 rounded text-xs font-medium border transition ${willUpdate ? "border-teal-500 bg-teal-500 text-white" : "border-white/10 text-slate-500"}`}
                         >
                           Update
                         </button>
@@ -2618,7 +2606,7 @@ function BulkCreatePanel({ templates, library, currentUid, onGenerate, onClose }
               {newOnes.length} new sub-type{newOnes.length === 1 ? "" : "s"}
               {dupes.length > 0 && <>, {updateCount} update{updateCount === 1 ? "" : "s"}, {dupes.length - updateCount} left unchanged</>}
               {(sourceKind === "template" && chosenTemplate) || (sourceKind === "subtype" && chosenSubtypeOption) ? (
-                <> — from <span className="text-indigo-300">{sourceKind === "template" ? chosenTemplate.name : chosenSubtypeOption.label}</span></>
+                <> — from <span className="text-teal-300">{sourceKind === "template" ? chosenTemplate.name : chosenSubtypeOption.label}</span></>
               ) : ""}.
             </p>
             <Btn variant="accent" onClick={handleGenerate}>
@@ -2672,7 +2660,7 @@ function TemplateImportBox({ onImport }) {
   return (
     <div className="rounded-xl border border-white/10 bg-[#111528] p-4 mb-5">
       <div className="flex items-center gap-2 text-sm font-semibold text-slate-100 mb-1">
-        <LayoutTemplate size={15} className="text-indigo-400" /> Import a template
+        <LayoutTemplate size={15} className="text-teal-400" /> Import a template
       </div>
       <p className="text-xs text-slate-500 mb-3">
         Paste or upload a sub-type's JSON (its custom fields and status workflow). It becomes a reusable template —
@@ -2686,7 +2674,7 @@ function TemplateImportBox({ onImport }) {
         value={pasteText}
         onChange={(e) => setPasteText(e.target.value)}
         rows={6}
-        className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-xs font-mono text-slate-100 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 mb-3"
+        className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-xs font-mono text-slate-100 outline-none focus:border-teal-400 focus:ring-2 focus:ring-teal-400/20 mb-3"
         placeholder='{ "ticketKey": "StockGap", "customFieldsMetaData": [...], "statusWorkFlow": [...] }'
       />
       <div className="flex items-center gap-2">
@@ -2733,7 +2721,7 @@ function TemplateFromLibraryBox({ library, onImport }) {
   return (
     <div className="rounded-xl border border-white/10 bg-[#111528] p-4 mb-5">
       <div className="flex items-center gap-2 text-sm font-semibold text-slate-100 mb-1">
-        <ListTree size={15} className="text-indigo-400" /> Or turn an existing sub-type into a template
+        <ListTree size={15} className="text-teal-400" /> Or turn an existing sub-type into a template
       </div>
       <p className="text-xs text-slate-500 mb-3">
         Pick any sub-type already in your library — its custom fields and status workflow become the template, no JSON copy/paste needed.
@@ -2787,7 +2775,7 @@ function TemplateCard({ template, onChange, onDelete, onDuplicate, onSetDefault 
             key={t.id}
             type="button"
             onClick={() => setTab(t.id)}
-            className={`px-3 py-2 text-xs font-medium border-b-2 -mb-px transition ${tab === t.id ? "border-indigo-400 text-indigo-300" : "border-transparent text-slate-500 hover:text-slate-300"}`}
+            className={`px-3 py-2 text-xs font-medium border-b-2 -mb-px transition ${tab === t.id ? "border-teal-400 text-teal-300" : "border-transparent text-slate-500 hover:text-slate-300"}`}
           >
             {t.label}
           </button>
@@ -2876,11 +2864,11 @@ function opTone(op, preview) {
   if (op.op === "note") return "amber";
   if (preview && !preview.applied) return "amber";
   if (op.op.toLowerCase().startsWith("remove")) return "rose";
-  return "indigo";
+  return "teal";
 }
 
 const OP_TONE_CLASSES = {
-  indigo: "border-indigo-500/30 bg-indigo-500/5",
+  teal: "border-teal-500/30 bg-teal-500/5",
   rose: "border-rose-500/30 bg-rose-500/5",
   amber: "border-amber-500/30 bg-amber-500/5",
 };
@@ -2891,7 +2879,7 @@ function ChangeOpsReview({ ops, checked, previews, onToggle, onApply }) {
     <div className="rounded-xl border border-white/10 bg-[#111528] p-4">
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-2 text-sm font-semibold text-slate-100">
-          <Diff size={15} className="text-indigo-400" /> Proposed changes ({ops.length})
+          <Diff size={15} className="text-teal-400" /> Proposed changes ({ops.length})
         </div>
         <Btn variant="accent" small onClick={onApply}>
           <Check size={14} />Apply {selectedCount} selected
@@ -2917,7 +2905,7 @@ function ChangeOpsReview({ ops, checked, previews, onToggle, onApply }) {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2 flex-wrap mb-0.5">
                   <span className="text-xs font-mono text-slate-500">{op.op}</span>
-                  {op.ticketKey && <span className="text-xs font-mono text-indigo-400">{op.ticketKey}</span>}
+                  {op.ticketKey && <span className="text-xs font-mono text-teal-400">{op.ticketKey}</span>}
                   {op.subTypeKey && <span className="text-xs font-mono text-slate-500">/ {op.subTypeKey}</span>}
                   {op.statusCode && <span className="text-xs font-mono text-slate-500">/ {op.statusCode}</span>}
                 </div>
@@ -3003,7 +2991,7 @@ function ExcelDiffPanel({ library, onApply, onExport }) {
     <div>
       <div className="rounded-xl border border-white/10 bg-[#111528] p-4 mb-5">
         <div className="flex items-center gap-2 text-sm font-semibold text-slate-100 mb-1">
-          <FileSpreadsheet size={15} className="text-indigo-400" /> Upload an edited Excel sheet
+          <FileSpreadsheet size={15} className="text-teal-400" /> Upload an edited Excel sheet
         </div>
         <p className="text-xs text-slate-500 mb-4">
           Works with no extra instructions or context from whoever makes the edits. Export the current sheet (one ticket
@@ -3103,7 +3091,7 @@ function AiUpdatePanel({ library, onApply }) {
     <div>
       <div className="rounded-xl border border-white/10 bg-[#111528] p-4 mb-5">
         <div className="flex items-center gap-2 text-sm font-semibold text-slate-100 mb-1">
-          <Wand2 size={15} className="text-indigo-400" /> Describe changes in plain English
+          <Wand2 size={15} className="text-teal-400" /> Describe changes in plain English
         </div>
         <p className="text-xs text-slate-500 mb-4">
           Faster when you already know exactly what to say, but it can only act on what you write — if the wording is
@@ -3119,7 +3107,7 @@ function AiUpdatePanel({ library, onApply }) {
           value={reqText}
           onChange={(e) => setReqText(e.target.value)}
           rows={7}
-          className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20 mb-3"
+          className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] px-3 py-2 text-sm text-slate-100 outline-none focus:border-teal-400 focus:ring-2 focus:ring-teal-400/20 mb-3"
           placeholder={"e.g.\n- On sub-type StockGap, remove assignee role Str_Mgr and add Regional_Mgr\n- Add a new status \"On Hold\" (code onHold) to StockGap, visible to viewers, settable by Dist_Mgr\n- On the On Hold status, add a mandatory text field \"Remark\" (key remark)"}
         />
         {error && <p className="text-xs text-rose-400 mb-3">{error}</p>}
@@ -3158,7 +3146,7 @@ function SmartUpdateTab({ library, onApply, onExportExcel }) {
             key={m.id}
             type="button"
             onClick={() => setMode(m.id)}
-            className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition ${mode === m.id ? "border-indigo-400 text-indigo-300" : "border-transparent text-slate-500 hover:text-slate-300"}`}
+            className={`px-3 py-2 text-sm font-medium border-b-2 -mb-px transition ${mode === m.id ? "border-teal-400 text-teal-300" : "border-transparent text-slate-500 hover:text-slate-300"}`}
           >
             {m.label}
           </button>
@@ -3180,16 +3168,16 @@ function DetailsTab({ doc, onChange }) {
     <div className="max-w-2xl">
       <div className="grid grid-cols-2 gap-4 mb-4">
         <div>
-          <Label mono hint="Unique internal code for this whole ticket type, no spaces">Ticket key</Label>
+          <Label mono>Ticket key</Label>
           <Input mono value={doc.ticketKey} onChange={(v) => onChange({ ...doc, ticketKey: v })} placeholder="e.g. DSHHPLv1" />
         </div>
         <div>
-          <Label mono hint="Which tenant/organization this ticket type belongs to">Tenant ID</Label>
+          <Label mono>Tenant ID</Label>
           <Input mono value={doc.tenantId} onChange={(v) => onChange({ ...doc, tenantId: v })} placeholder="e.g. abc" />
         </div>
       </div>
       <div className="mb-4">
-        <Label hint="The display name people see when creating this ticket">Ticket type name</Label>
+        <Label>Ticket type name</Label>
         <Input value={doc.ticketType} onChange={(v) => onChange({ ...doc, ticketType: v })} placeholder="e.g. DS Household Plano Stock Request-v1" />
       </div>
       <Toggle checked={doc.deleted} onChange={(v) => onChange({ ...doc, deleted: v })} label="Deleted" />
@@ -3202,15 +3190,15 @@ function RolesTab({ doc, onChange }) {
     <div className="max-w-2xl space-y-5">
       <div>
         <Label>Creators — roles allowed to raise this ticket</Label>
-        <TagInput values={doc.creators} onChange={(v) => onChange({ ...doc, creators: v })} placeholder="e.g. merchandiseanalyst — press enter" tone="indigo" />
+        <TagInput values={doc.creators} onChange={(v) => onChange({ ...doc, creators: v })} placeholder="e.g. merchandiseanalyst — press enter" tone="teal" />
       </div>
       <div>
         <Label>Viewers — roles allowed to view this ticket</Label>
-        <TagInput values={doc.viewers} onChange={(v) => onChange({ ...doc, viewers: v })} placeholder="e.g. vendorRole — press enter" tone="indigo" />
+        <TagInput values={doc.viewers} onChange={(v) => onChange({ ...doc, viewers: v })} placeholder="e.g. vendorRole — press enter" tone="teal" />
       </div>
       <div>
         <Label>Assignees — roles this ticket can be routed to</Label>
-        <TagInput values={doc.assignee} onChange={(v) => onChange({ ...doc, assignee: v })} placeholder="e.g. Dist_Mgr — press enter" tone="indigo" />
+        <TagInput values={doc.assignee} onChange={(v) => onChange({ ...doc, assignee: v })} placeholder="e.g. Dist_Mgr — press enter" tone="teal" />
       </div>
     </div>
   );
@@ -3287,7 +3275,7 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
             value={term}
             onChange={(e) => setTerm(e.target.value)}
             placeholder="Search ticket types or sub-types…"
-            className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] pl-3 pr-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-400/20"
+            className="w-full rounded-lg border border-white/10 bg-[#0B0F1C] pl-3 pr-3 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 outline-none focus:border-teal-400 focus:ring-2 focus:ring-teal-400/20"
           />
         </div>
         <Btn variant="ghost" onClick={onExportAll}><Download size={15} />Export all ({library.length})</Btn>
@@ -3305,7 +3293,7 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
           const isSelected = d._uid === selectedUid;
           const isOpen = term ? subMatches.length > 0 : !!expanded[d._uid];
           return (
-            <div key={d._uid} className={`rounded-xl border bg-[#111528] overflow-hidden ${isSelected ? "border-indigo-500/50" : "border-white/10"}`}>
+            <div key={d._uid} className={`rounded-xl border bg-[#111528] overflow-hidden ${isSelected ? "border-teal-500/50" : "border-white/10"}`}>
               <div className="flex items-center gap-3 px-4 py-3">
                 <button
                   onClick={() => setExpanded((e) => ({ ...e, [d._uid]: !e[d._uid] }))}
@@ -3744,15 +3732,12 @@ export default function App({ initialData } = {}) {
   };
 
   return (
-    <div
-      className="min-h-screen bg-[#070A13] bg-[radial-gradient(ellipse_90%_50%_at_50%_-10%,rgba(129,140,248,0.14),rgba(7,10,19,0)_60%)] flex text-slate-200"
-      style={{ fontFamily: "Inter, ui-sans-serif, system-ui" }}
-    >
+    <div className="min-h-screen bg-[#070A13] flex text-slate-200" style={{ fontFamily: "Inter, ui-sans-serif, system-ui" }}>
       {/* sidebar */}
       <aside className="w-60 shrink-0 bg-[#050710] text-slate-300 flex flex-col border-r border-white/5">
         <div className="px-5 py-5 border-b border-white/5">
           <div className="flex items-center gap-2 text-white font-semibold">
-            <Workflow size={18} className="text-indigo-400" />
+            <Workflow size={18} className="text-teal-400" />
             Ticket Type Builder
           </div>
           <div className="text-[11px] text-slate-500 mt-0.5">Ticket type dataset</div>
@@ -3765,7 +3750,7 @@ export default function App({ initialData } = {}) {
                 key={n.id}
                 onClick={() => !disabled && setTab(n.id)}
                 disabled={disabled}
-                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium transition ${tab === n.id ? "bg-indigo-400/15 text-indigo-200 shadow-[inset_0_0_0_1px_rgba(129,140,248,0.25)]" : disabled ? "text-slate-700 cursor-not-allowed" : "hover:bg-white/5 text-slate-400"}`}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm transition ${tab === n.id ? "bg-teal-500/10 text-teal-300" : disabled ? "text-slate-700 cursor-not-allowed" : "hover:bg-white/5 text-slate-400"}`}
               >
                 {n.icon}
                 {n.label}
