@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useCallback } from "react";
+ import React, { useState, useMemo, useCallback } from "react";
 import {
   Plus, Trash2, ChevronDown, ChevronRight, Copy, Download,
   FileJson, Users, Ticket, ListTree, Workflow, Check, X,
@@ -98,7 +98,11 @@ const emptyDoc = () => ({
    the exported JSON untouched, so round-tripping through this app never
    silently deletes fields it doesn't have a form for. */
 const DOC_KNOWN_KEYS = new Set(["ticketKey", "ticketType", "tenantId", "creators", "viewers", "assignee", "deleted", "ticketSubType"]);
-const SUBTYPE_KNOWN_KEYS = new Set(["ticketKey", "prefix", "ticketType", "customFieldsMetaData", "statusWorkFlow", "deleted", "isAutoEscalation", "assignee"]);
+// "roles" is listed on purpose even though the editor has no field for it:
+// viewer/creator roles belong to the ticket type only, and a sub-type only
+// carries `assignee`. Older live JSON has a stray sub-type-level `roles`
+// array, so it is dropped on import instead of being passed through.
+const SUBTYPE_KNOWN_KEYS = new Set(["ticketKey", "prefix", "ticketType", "customFieldsMetaData", "statusWorkFlow", "deleted", "isAutoEscalation", "assignee", "roles"]);
 
 function extractPassthrough(src, knownKeys) {
   const passthrough = {};
@@ -153,9 +157,13 @@ function clean(value) {
   return value; // booleans, numbers, null->kept only if explicitly not undefined
 }
 
-function advancedToJson(f) {
+// `explicitMandatory` is set for sub-type level custom fields, which always
+// carry an explicit isMandatory (true or false) like the live schema does.
+// Status-level fields (remarks etc.) keep the old "only when true" shape.
+function advancedToJson(f, explicitMandatory) {
   const out = {};
-  if (f.isMandatory) out.isMandatory = true;
+  if (explicitMandatory) out.isMandatory = !!f.isMandatory;
+  else if (f.isMandatory) out.isMandatory = true;
   if (f.disabled) out.disabled = true;
   if (f.displayLabel) out.displayLabel = f.displayLabel;
   if (f.dependentOn) out.dependentOn = f.dependentOn;
@@ -169,8 +177,8 @@ function optionToJson(o) {
   return out;
 }
 
-function fieldToJson(f) {
-  const adv = advancedToJson(f);
+function fieldToJson(f, subTypeLevel = false) {
+  const adv = advancedToJson(f, subTypeLevel);
   if (OPTION_BASED_TYPES.includes(f.type)) {
     return { label: f.label, key: f.key, type: f.type, options: (f.options || []).map(optionToJson), ...adv };
   }
@@ -219,7 +227,7 @@ function statusToJson(s) {
     mandatoryCustomFields: s.mandatoryCustomFields,
     overrideStatus: s.overrideStatus,
     dependentStatus: s.dependentStatus,
-    customFieldsMetaData: (s.customFieldsMetaData || []).map(fieldToJson),
+    customFieldsMetaData: (s.customFieldsMetaData || []).map((f) => fieldToJson(f)),
     autoEscalationConfig: (s.autoEscalationConfig || []).map((e) => ({
       assignee: e.assignee, days: e.days === "" ? undefined : Number(e.days),
       overrideStatus: e.overrideStatus, notification: e.notification,
@@ -233,7 +241,7 @@ function subTypeToJson(st) {
     ...(st._passthrough || {}),
     ticketKey: st.ticketKey, prefix: st.prefix, ticketType: st.ticketType,
     assignee: (st.assigneeRoles || []).map((r) => ({ roleId: r })),
-    customFieldsMetaData: (st.customFieldsMetaData || []).map(fieldToJson),
+    customFieldsMetaData: (st.customFieldsMetaData || []).map((f) => fieldToJson(f, true)),
     statusWorkFlow: (st.statusWorkFlow || []).map(statusToJson),
     deleted: st.deleted, isAutoEscalation: st.isAutoEscalation,
   };
@@ -557,13 +565,21 @@ function xParseMandateRules(sheet) {
     const commentsCell = xnorm(xCell(r, offset + 2));
     const assigneeYnCell = xnorm(xCell(r, offset + 3));
     const assigneeRoleCell = xnorm(xCell(r, offset + 4));
-    let commentsLabel = commentsCell && !xIsYes(commentsCell) ? commentsCell : "Comments";
+    // The exporter writes an explicit "No" for statuses without a remark field;
+    // that must read back as "not mandatory", not as a field labelled "No".
+    const commentsOff = ["no", "n", "false", "0"].includes(commentsCell.toLowerCase());
+    let commentsLabel = commentsCell && !commentsOff && !xIsYes(commentsCell) ? commentsCell : "Comments";
     commentsLabel = commentsLabel.replace(/\(mandatory\)/i, "").trim();
+    // optional "(Number)" / "(Date)" / "(Text)" suffix sets the remark field's type
+    const typeMatch = commentsLabel.match(/\((text|number|date)\)\s*$/i);
+    const commentsType = typeMatch ? typeMatch[1].toLowerCase() : "text";
+    if (typeMatch) commentsLabel = commentsLabel.replace(/\((text|number|date)\)\s*$/i, "").trim();
     byTicket[ticketKey] = byTicket[ticketKey] || {};
     byTicket[ticketKey][xToStatusCode(label)] = {
       mandatoryImages: xIsYes(imagesCell),
-      mandatoryComments: xIsYes(commentsCell) || !!commentsCell,
+      mandatoryComments: !commentsOff && (xIsYes(commentsCell) || !!commentsCell),
       commentsLabel,
+      commentsType,
       mandatoryNewAssignee: xIsYes(assigneeYnCell),
       newAssigneeRole: assigneeRoleCell,
     };
@@ -644,7 +660,7 @@ function xBuildStatusWorkflow(subtypeName, globalStatusRoles, mandateRules, esca
     if (mandate.mandatoryComments) {
       const key = xToCamelKey(mandate.commentsLabel || "Comments");
       mandatoryFields.push(key);
-      customFields.push({ label: mandate.commentsLabel || "Comments", key, type: "text" });
+      customFields.push({ label: mandate.commentsLabel || "Comments", key, type: mandate.commentsType || "text" });
     }
     if (mandate.mandatoryNewAssignee) mandatoryFields.push("newAssignee");
 
@@ -659,14 +675,13 @@ function xBuildStatusWorkflow(subtypeName, globalStatusRoles, mandateRules, esca
     return {
       status: code,
       label: roleInfo.label || code.charAt(0).toUpperCase() + code.slice(1),
-      // "open" isn't visible to viewers by default (ticket hasn't been
-      // triaged/picked up yet) -- every other status still defaults to
-      // public, same as before.
-      public: code !== "open",
+      // Every status is public (including "open"), matching the live schema.
+      public: true,
       roles: roleInfo.roles || [],
       assignee: assigneeRoles.map((r) => ({ roleId: r })),
-      notification: autoEscalation.length > 0,
-      notificationType: autoEscalation.length ? ["inApp", "email"] : [],
+      // Specs never say how to notify, so every status gets in-app + email by default.
+      notification: true,
+      notificationType: ["inApp", "email"],
       notificationRole: roleInfo.roles || [],
       mandatoryCustomFields: mandatoryFields,
       customFieldsMetaData: customFields,
@@ -1244,7 +1259,7 @@ function excelWorkbookFromDocs(docs) {
       mandateMap.set(code, {
         label: st.label || st.status,
         images: mand.includes("images") ? "Yes" : "No",
-        comments: commentField ? commentField.label : (mand.includes("comments") ? "Yes" : "No"),
+        comments: commentField ? commentField.label + (commentField.type && commentField.type !== "text" ? ` (${commentField.type})` : "") : (mand.includes("comments") ? "Yes" : "No"),
         newAssignee: mand.includes("newAssignee") ? "Yes" : "No",
         newAssigneeRole: (st.assigneeRoles || []).join(", "),
       });
@@ -1314,6 +1329,7 @@ function templateFromRawJson(raw, name) {
     data: {
       prefix: st.prefix || "",
       isAutoEscalation: st.isAutoEscalation,
+      assigneeRoles: st.assigneeRoles || [],
       customFieldsMetaData: st.customFieldsMetaData,
       statusWorkFlow: st.statusWorkFlow,
     },
@@ -1327,6 +1343,7 @@ function templateDataFromSubType(sub) {
   return {
     prefix: sub.prefix || "",
     isAutoEscalation: !!sub.isAutoEscalation,
+    assigneeRoles: sub.assigneeRoles || [],
     customFieldsMetaData: sub.customFieldsMetaData || [],
     statusWorkFlow: sub.statusWorkFlow || [],
   };
@@ -1344,6 +1361,7 @@ function subTypeFromTemplate(template, name, ticketKey) {
     ticketType: name,
     deleted: false,
     isAutoEscalation: !!cloned.isAutoEscalation,
+    assigneeRoles: cloned.assigneeRoles || [],
     customFieldsMetaData: cloned.customFieldsMetaData || [],
     statusWorkFlow: cloned.statusWorkFlow || [],
   };
