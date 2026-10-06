@@ -1,4 +1,4 @@
- import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback } from "react";
 import {
   Plus, Trash2, ChevronDown, ChevronRight, Copy, Download,
   FileJson, Users, Ticket, ListTree, Workflow, Check, X,
@@ -257,7 +257,15 @@ function docToJson(doc) {
     deleted: doc.deleted,
     ticketSubType: doc.ticketSubType.map(subTypeToJson),
   };
-  return clean(raw);
+  const cleaned = clean(raw) || {};
+  // tenantId is a required field: clean() drops empty strings, so put it
+  // back (in its usual position) as "" instead of omitting the key.
+  const out = {};
+  Object.keys(raw).forEach((k) => {
+    if (k === "tenantId") out.tenantId = doc.tenantId || "";
+    else if (k in cleaned) out[k] = cleaned[k];
+  });
+  return out;
 }
 
 /* reverse mapping: raw ticket-type JSON -> editable state, so an
