@@ -545,12 +545,18 @@ function xParseStatusAccessRoles(sheet) {
   if (headerIdx === -1) return byTicket;
   const headerRow = rows[headerIdx].map((h) => xnorm(h).toLowerCase());
   const offset = headerRow[0] && headerRow[0].includes("ticket key") ? 1 : 0;
+  const publicCol = headerRow.findIndex((h) => h.includes("public"));
   for (const r of rows.slice(headerIdx + 1)) {
     const label = xnorm(xCell(r, offset + 0));
     if (!label) continue;
     const ticketKey = offset ? (xnorm(xCell(r, 0)) || "__default__") : "__default__";
     byTicket[ticketKey] = byTicket[ticketKey] || {};
-    byTicket[ticketKey][xToStatusCode(label)] = { label, roles: xSplitRoles(xCell(r, offset + 1)) };
+    // optional "Public" column: Yes/No overrides the default (only "open" is public)
+    const publicCell = publicCol >= 0 ? xnorm(xCell(r, publicCol)) : "";
+    byTicket[ticketKey][xToStatusCode(label)] = {
+      label, roles: xSplitRoles(xCell(r, offset + 1)),
+      public: publicCell ? xIsYes(publicCell) : undefined,
+    };
   }
   return byTicket;
 }
@@ -683,8 +689,9 @@ function xBuildStatusWorkflow(subtypeName, globalStatusRoles, mandateRules, esca
     return {
       status: code,
       label: roleInfo.label || code.charAt(0).toUpperCase() + code.slice(1),
-      // Every status is public (including "open"), matching the live schema.
-      public: true,
+      // Only "open" is public by default; every other status is private unless
+      // the sheet's optional "Public" column says Yes.
+      public: roleInfo.public !== undefined ? roleInfo.public : code === "open",
       roles: roleInfo.roles || [],
       assignee: assigneeRoles.map((r) => ({ roleId: r })),
       // Specs never say how to notify, so every status gets in-app + email by default.
@@ -1239,16 +1246,16 @@ function excelWorkbookFromDocs(docs) {
     XLSX.utils.book_append_sheet(wb, ws_, "API Dropdowns");
   }
 
-  const roleRows = [["Ticket Key", "Status", "Roles Allowed"]];
+  const roleRows = [["Ticket Key", "Status", "Roles Allowed", "Public"]];
   list.forEach((doc) => {
     const statusRoles = new Map();
     doc.ticketSubType.forEach((s) => s.statusWorkFlow.forEach((st) => {
       const code = xToStatusCode(st.status);
-      const entry = statusRoles.get(code) || { label: st.label || st.status, roles: new Set() };
+      const entry = statusRoles.get(code) || { label: st.label || st.status, roles: new Set(), isPublic: !!st.public };
       (st.roles || []).forEach((r) => entry.roles.add(r));
       statusRoles.set(code, entry);
     }));
-    statusRoles.forEach((v) => roleRows.push([doc.ticketKey, v.label, [...v.roles].join(", ")]));
+    statusRoles.forEach((v) => roleRows.push([doc.ticketKey, v.label, [...v.roles].join(", "), v.isPublic ? "Yes" : "No"]));
   });
   {
     const ws_ = XLSX.utils.aoa_to_sheet(roleRows);
