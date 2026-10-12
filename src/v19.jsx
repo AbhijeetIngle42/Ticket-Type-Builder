@@ -67,9 +67,18 @@ const newChildOption = () => ({ id: uid(), value: "", key: "" });
 const newSimpleOption = () => ({ id: uid(), value: "", key: "", dependentCustomFields: [] });
 const newMatrixColumn = () => ({ id: uid(), label: "", key: "", type: "text", options: [], formula: "" });
 
+/* RFC 4122 v4 UUID. Every auto-escalation level carries one as its `_id`. */
+function uuidv4() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    return (c === "x" ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+
 const newAutoEscalation = () => ({
-  id: uid(), assignee: "", days: "", overrideStatus: "",
-  notification: true, notificationType: [], ccAddress: [],
+  id: uid(), _id: uuidv4(), assignee: "", days: "", overrideStatus: "",
+  notification: true, notificationType: ["inApp", "email"], ccAddress: [],
 });
 
 const newStatus = () => ({
@@ -128,6 +137,8 @@ function regenerateIds(node) {
     const out = {};
     Object.keys(node).forEach((k) => { out[k] = regenerateIds(node[k]); });
     if (Object.prototype.hasOwnProperty.call(out, "id")) out.id = uid();
+    // escalation levels carry a string uuid `_id`; a clone must get its own
+    if (typeof out._id === "string") out._id = uuidv4();
     return out;
   }
   return node;
@@ -230,11 +241,16 @@ function statusToJson(s) {
     customFieldsMetaData: (s.customFieldsMetaData || []).map((f) => fieldToJson(f)),
     autoEscalationConfig: (s.autoEscalationConfig || []).map((e) => ({
       assignee: e.assignee, days: e.days === "" ? undefined : Number(e.days),
-      overrideStatus: e.overrideStatus, notification: e.notification,
+      notification: e.notification, overrideStatus: e.overrideStatus,
       notificationType: e.notificationType, ccAddress: e.ccAddress,
+      _id: e._id || uuidv4(),
     })),
   };
 }
+
+/* A sub-type "has auto-escalation" as soon as any of its statuses has an
+   escalation level; isAutoEscalation is then always true on export. */
+const subTypeHasEscalation = (st) => (st.statusWorkFlow || []).some((w) => (w.autoEscalationConfig || []).length > 0);
 
 function subTypeToJson(st) {
   return {
@@ -243,7 +259,7 @@ function subTypeToJson(st) {
     assignee: (st.assigneeRoles || []).map((r) => ({ roleId: r })),
     customFieldsMetaData: (st.customFieldsMetaData || []).map((f) => fieldToJson(f, true)),
     statusWorkFlow: (st.statusWorkFlow || []).map(statusToJson),
-    deleted: st.deleted, isAutoEscalation: st.isAutoEscalation,
+    deleted: st.deleted, isAutoEscalation: !!st.isAutoEscalation || subTypeHasEscalation(st),
   };
 }
 
@@ -266,6 +282,68 @@ function docToJson(doc) {
     else if (k in cleaned) out[k] = cleaned[k];
   });
   return out;
+}
+
+/* Creators and viewers are required on every ticket type: returns the names
+   of the required role lists that are empty (used to block exports). */
+function missingRequiredRoles(doc) {
+  const missing = [];
+  if (!doc.creators || !doc.creators.length) missing.push("Creators");
+  if (!doc.viewers || !doc.viewers.length) missing.push("Viewers");
+  return missing;
+}
+
+/* Assignee roles used by a sub-type's workflow: the roles named as a status's
+   new assignee and as an escalation level's assignee. Escalation levels with
+   no assignee are returned separately (a level must always have one). */
+function usedAssigneeRoles(sub) {
+  const roles = new Set();
+  const blankLevels = [];
+  (sub.statusWorkFlow || []).forEach((w) => {
+    (w.assigneeRoles || []).forEach((r) => { if (xnorm(r)) roles.add(xnorm(r)); });
+    (w.autoEscalationConfig || []).forEach((e, i) => {
+      const a = xnorm(e.assignee);
+      if (a) roles.add(a); else blankLevels.push(`status "${w.label || w.status || "(untitled)"}" escalation level ${i + 1}`);
+    });
+  });
+  return { roles: [...roles], blankLevels };
+}
+
+/* Rules (checked before every export):
+   - every sub-type needs assignee roles, on the sub-type or the ticket type;
+   - every escalation level needs an assignee role;
+   - every role used as a status assignee or escalation assignee must be listed
+     in BOTH the sub-type's and the ticket type's assignee roles.
+   Returns [{ text, fixable }]; `fixable` ones are solved by syncAssigneeRoles(). */
+function assigneeProblems(doc) {
+  const out = [];
+  const root = doc.assignee || [];
+  (doc.ticketSubType || []).forEach((s) => {
+    const name = s.ticketType || s.ticketKey || "(untitled sub-type)";
+    const own = s.assigneeRoles || [];
+    if (!own.length && !root.length) out.push({ text: `${name}: no assignee roles — set them on the sub-type or the ticket type` });
+    const { roles, blankLevels } = usedAssigneeRoles(s);
+    blankLevels.forEach((b) => out.push({ text: `${name}: ${b} has no assignee role` }));
+    const missSub = roles.filter((r) => !own.includes(r));
+    const missRoot = roles.filter((r) => !root.includes(r));
+    if (missSub.length || missRoot.length) {
+      const where = [missSub.length ? `sub-type (${missSub.join(", ")})` : "", missRoot.length ? `ticket type (${missRoot.join(", ")})` : ""].filter(Boolean).join(" and ");
+      out.push({ fixable: true, text: `${name}: assignee roles used by the workflow are missing from the ${where}` });
+    }
+  });
+  return out;
+}
+
+/* Adds every role a workflow uses to both the sub-type's and the ticket type's assignee roles. */
+function syncAssigneeRoles(doc) {
+  const rootAdd = [];
+  const subs = (doc.ticketSubType || []).map((s) => {
+    const { roles } = usedAssigneeRoles(s);
+    roles.forEach((r) => { if (!rootAdd.includes(r)) rootAdd.push(r); });
+    const add = roles.filter((r) => !(s.assigneeRoles || []).includes(r));
+    return add.length ? { ...s, assigneeRoles: [...(s.assigneeRoles || []), ...add] } : s;
+  });
+  return { ...doc, assignee: [...(doc.assignee || []), ...rootAdd.filter((r) => !(doc.assignee || []).includes(r))], ticketSubType: subs };
 }
 
 /* reverse mapping: raw ticket-type JSON -> editable state, so an
@@ -347,7 +425,8 @@ function statusFromJson(s) {
     dependentStatus: Array.isArray(s.dependentStatus) ? s.dependentStatus : [],
     customFieldsMetaData: (s.customFieldsMetaData || []).map(fieldFromJson),
     autoEscalationConfig: (s.autoEscalationConfig || []).map((e) => ({
-      id: uid(), assignee: e.assignee || "", days: e.days != null ? String(e.days) : "",
+      id: uid(), _id: typeof e._id === "string" && e._id ? e._id : uuidv4(),
+      assignee: e.assignee || "", days: e.days != null ? String(e.days) : "",
       overrideStatus: e.overrideStatus || "", notification: !!e.notification,
       notificationType: Array.isArray(e.notificationType) ? e.notificationType : [],
       ccAddress: Array.isArray(e.ccAddress) ? e.ccAddress : [],
@@ -537,44 +616,66 @@ function xParseTicketStructure(sheet, subtypesByTicket) {
 /* Optional leading "Ticket Key" column groups rows per ticket type;
    without it, everything lands under "__default__". Returns a map of
    ticketKey -> { statusCode -> { label, roles } }. */
-function xParseStatusAccessRoles(sheet) {
+const X_ALL_SUBTYPES = "(all sub-types)";
+/* Bucket key for a whole ticket type, or for one sub-type of it. */
+const xScopeKey = (ticketKey, subtype) => (subtype && subtype !== X_ALL_SUBTYPES ? `${ticketKey}||${subtype}` : ticketKey);
+
+/* Shared reader for the two status sheets (Status Access Roles / Mandate
+   rules). Optional leading columns, detected from the header row:
+     [Ticket Key] [Ticket Subtype] Status ...
+   Ticket Key and Ticket Subtype "stick down" the sheet until a new value is
+   given, so a block only needs them on its first row and blocks can be
+   separated by blank rows. A blank or "(all sub-types)" sub-type means the
+   rows apply to every sub-type of that ticket type; a named sub-type gets
+   its own block, which replaces the shared one for that sub-type. */
+function xStatusSheetRows(sheet) {
   const rows = xRowsOf(sheet);
-  const byTicket = {};
-  if (!rows.length) return byTicket;
-  let headerIdx = rows.findIndex((r) => xnorm(xCell(r, 0)).toLowerCase().includes("status") || xnorm(xCell(r, 1)).toLowerCase().includes("status"));
-  if (headerIdx === -1) return byTicket;
+  const headerIdx = rows.findIndex((r) => r.slice(0, 4).some((c) => xnorm(c).toLowerCase().includes("status")));
+  if (headerIdx === -1) return { headerRow: [], offset: 0, items: [] };
   const headerRow = rows[headerIdx].map((h) => xnorm(h).toLowerCase());
-  const offset = headerRow[0] && headerRow[0].includes("ticket key") ? 1 : 0;
-  const publicCol = headerRow.findIndex((h) => h.includes("public"));
+  const hasKey = !!headerRow[0] && headerRow[0].includes("ticket key");
+  const hasSub = hasKey && !!headerRow[1] && headerRow[1].includes("subtype");
+  const offset = (hasKey ? 1 : 0) + (hasSub ? 1 : 0);
+  const items = [];
+  let curKey = "__default__";
+  let curSub = "";
   for (const r of rows.slice(headerIdx + 1)) {
-    const label = xnorm(xCell(r, offset + 0));
+    if (hasKey) {
+      const k = xnorm(xCell(r, 0));
+      if (k) { curKey = k; curSub = hasSub ? xnorm(xCell(r, 1)) : ""; }
+      else if (hasSub && xnorm(xCell(r, 1))) curSub = xnorm(xCell(r, 1));
+    }
+    const label = xnorm(xCell(r, offset));
     if (!label) continue;
-    const ticketKey = offset ? (xnorm(xCell(r, 0)) || "__default__") : "__default__";
-    byTicket[ticketKey] = byTicket[ticketKey] || {};
+    items.push({ scope: xScopeKey(curKey, curSub), r, label });
+  }
+  return { headerRow, offset, items };
+}
+
+/* Returns scopeKey (ticketKey or ticketKey||subtype) -> { statusCode -> { label, roles, public } }.
+   Status codes keep the order the rows appear in the sheet. */
+function xParseStatusAccessRoles(sheet) {
+  const { headerRow, offset, items } = xStatusSheetRows(sheet);
+  const publicCol = headerRow.findIndex((h) => h.includes("public"));
+  const byScope = {};
+  for (const { scope, r, label } of items) {
+    byScope[scope] = byScope[scope] || {};
     // optional "Public" column: Yes/No overrides the default (only "open" is public)
     const publicCell = publicCol >= 0 ? xnorm(xCell(r, publicCol)) : "";
-    byTicket[ticketKey][xToStatusCode(label)] = {
+    byScope[scope][xToStatusCode(label)] = {
       label, roles: xSplitRoles(xCell(r, offset + 1)),
       public: publicCell ? xIsYes(publicCell) : undefined,
     };
   }
-  return byTicket;
+  return byScope;
 }
 
 /* Same optional leading "Ticket Key" column convention as the roles
    sheet. Returns ticketKey -> { statusCode -> mandate rule }. */
 function xParseMandateRules(sheet) {
-  const rows = xRowsOf(sheet);
+  const { offset, items } = xStatusSheetRows(sheet);
   const byTicket = {};
-  if (!rows.length) return byTicket;
-  let headerIdx = rows.findIndex((r) => xnorm(xCell(r, 0)).toLowerCase().includes("status") || xnorm(xCell(r, 1)).toLowerCase().includes("status"));
-  if (headerIdx === -1) return byTicket;
-  const headerRow = rows[headerIdx].map((h) => xnorm(h).toLowerCase());
-  const offset = headerRow[0] && headerRow[0].includes("ticket key") ? 1 : 0;
-  for (const r of rows.slice(headerIdx + 1)) {
-    const label = xnorm(xCell(r, offset + 0));
-    if (!label) continue;
-    const ticketKey = offset ? (xnorm(xCell(r, 0)) || "__default__") : "__default__";
+  for (const { scope: ticketKey, r, label } of items) {
     const imagesCell = xnorm(xCell(r, offset + 1));
     const commentsCell = xnorm(xCell(r, offset + 2));
     const assigneeYnCell = xnorm(xCell(r, offset + 3));
@@ -660,8 +761,13 @@ function xParseEscalationDetails(sheet) {
 function xBuildStatusWorkflow(subtypeName, globalStatusRoles, mandateRules, escalationByStatus) {
   const preferredOrder = ["open", "inprogress", "resolved", "closed"];
   const allCodes = new Set([...Object.keys(globalStatusRoles), ...Object.keys(mandateRules), ...Object.keys(escalationByStatus)]);
-  const orderedCodes = preferredOrder.filter((c) => allCodes.has(c));
-  [...allCodes].sort().forEach((c) => { if (!orderedCodes.includes(c)) orderedCodes.push(c); });
+  // Statuses keep the order of the Status Access Roles sheet (the workflow
+  // order); any code that only appears in the mandate/escalation sheets is
+  // appended afterwards, standard statuses first, the rest alphabetical.
+  const orderedCodes = Object.keys(globalStatusRoles);
+  const leftover = [...allCodes].filter((c) => !orderedCodes.includes(c));
+  preferredOrder.filter((c) => leftover.includes(c)).forEach((c) => orderedCodes.push(c));
+  leftover.filter((c) => !orderedCodes.includes(c)).sort().forEach((c) => orderedCodes.push(c));
 
   return orderedCodes.map((code) => {
     const roleInfo = globalStatusRoles[code] || {};
@@ -1025,8 +1131,9 @@ function excelWorkbookToDocs(wb) {
     // sheet data when there's exactly one ticket type in the workbook.
     const subBucketKey = subtypesByTicket[ticketKeyLookup] ? ticketKeyLookup : (subtypesByTicket.__default__ ? "__default__" : ticketKeyLookup);
     const subBucket = subtypesByTicket[subBucketKey] || { subtypes: {}, order: [] };
-    const globalStatusRoles = statusRolesByTicket[ticketKeyLookup] || statusRolesByTicket.__default__ || {};
-    const mandateRules = mandateByTicket[ticketKeyLookup] || mandateByTicket.__default__ || {};
+    // a sub-type's own block (Ticket Subtype column) wins over the ticket type's shared block
+    const rolesFor = (name) => statusRolesByTicket[xScopeKey(ticketKeyLookup, name)] || statusRolesByTicket[ticketKeyLookup] || statusRolesByTicket.__default__ || {};
+    const mandateFor = (name) => mandateByTicket[xScopeKey(ticketKeyLookup, name)] || mandateByTicket[ticketKeyLookup] || mandateByTicket.__default__ || {};
     const escalationByStatus = escalationByTicket[ticketKeyLookup] || escalationByTicket.__default__ || {};
     const matrixBucketKey = matrixFieldsByTicket[ticketKeyLookup] ? ticketKeyLookup : (matrixFieldsByTicket.__default__ ? "__default__" : ticketKeyLookup);
     const matrixBySubtype = matrixFieldsByTicket[matrixBucketKey] || {};
@@ -1040,12 +1147,14 @@ function excelWorkbookToDocs(wb) {
       const matrixFields = (matrixBySubtype[name] || []).map(xMatrixFieldToOutput);
       const cascadeFields = (cascadeBySubtype[name] || []).map(xCascadeFieldToOutput);
       const apiFields = (apiBySubtype[name] || []).map(xApiFieldToOutput);
+      const statusWorkFlow = xBuildStatusWorkflow(name, rolesFor(name), mandateFor(name), escalationByStatus);
       return {
         ticketKey: st.ticketKey, prefix: st.prefix, ticketType: st.ticketType,
         assignee: (st.assigneeRoles || []).map((r) => ({ roleId: r })),
         customFieldsMetaData: [...st.customFieldsMetaData.map(xFieldToOutput), ...matrixFields, ...cascadeFields, ...apiFields],
-        statusWorkFlow: xBuildStatusWorkflow(name, globalStatusRoles, mandateRules, escalationByStatus),
-        deleted: st.deleted, isAutoEscalation: st.isAutoEscalation,
+        statusWorkFlow,
+        // escalation rules for this sub-type switch auto-escalation on
+        deleted: st.deleted, isAutoEscalation: !!st.isAutoEscalation || statusWorkFlow.some((w) => (w.autoEscalationConfig || []).length > 0),
       };
     });
 
@@ -1133,7 +1242,7 @@ function excelWorkbookFromDocs(docs) {
   const subRows = [["Ticket Key", "Ticket Subtype", "Subtype Key", "Prefix", "Assignee Roles", "Auto Escalation", "Delete"]];
   list.forEach((doc) => {
     doc.ticketSubType.forEach((s) => {
-      subRows.push([doc.ticketKey, s.ticketType, s.ticketKey, s.prefix, (s.assigneeRoles || []).join(", "), s.isAutoEscalation ? "Yes" : "No", s.deleted ? "Yes" : "No"]);
+      subRows.push([doc.ticketKey, s.ticketType, s.ticketKey, s.prefix, (s.assigneeRoles || []).join(", "), (s.isAutoEscalation || subTypeHasEscalation(s)) ? "Yes" : "No", s.deleted ? "Yes" : "No"]);
     });
   });
   {
@@ -1246,16 +1355,22 @@ function excelWorkbookFromDocs(docs) {
     XLSX.utils.book_append_sheet(wb, ws_, "API Dropdowns");
   }
 
-  const roleRows = [["Ticket Key", "Status", "Roles Allowed", "Public"]];
+  // Status Access Roles / Mandate rules are written as readable blocks: one
+  // block per sub-type, grouped by ticket type, always naming the sub-type.
+  // Ticket Key / Ticket Subtype appear on the first row of a block only, with
+  // a blank row between blocks. (The importer still accepts a blank or
+  // "(all sub-types)" sub-type for hand-written sheets.)
+  const statusBlocks = (doc, rowsOf) => doc.ticketSubType.map((s) => ({ name: s.ticketType || s.ticketKey, rows: rowsOf(s) }));
+  const pushStatusBlocks = (sheetRows, doc, blocks) => {
+    blocks.forEach((b) => {
+      b.rows.forEach((row, i) => sheetRows.push([i === 0 ? doc.ticketKey : "", i === 0 ? b.name : "", ...row]));
+      sheetRows.push([]);
+    });
+  };
+
+  const roleRows = [["Ticket Key", "Ticket Subtype", "Status", "Roles Allowed", "Public"]];
   list.forEach((doc) => {
-    const statusRoles = new Map();
-    doc.ticketSubType.forEach((s) => s.statusWorkFlow.forEach((st) => {
-      const code = xToStatusCode(st.status);
-      const entry = statusRoles.get(code) || { label: st.label || st.status, roles: new Set(), isPublic: !!st.public };
-      (st.roles || []).forEach((r) => entry.roles.add(r));
-      statusRoles.set(code, entry);
-    }));
-    statusRoles.forEach((v) => roleRows.push([doc.ticketKey, v.label, [...v.roles].join(", "), v.isPublic ? "Yes" : "No"]));
+    pushStatusBlocks(roleRows, doc, statusBlocks(doc, (s) => s.statusWorkFlow.map((st) => [st.label || st.status, (st.roles || []).join(", "), st.public ? "Yes" : "No"])));
   });
   {
     const ws_ = XLSX.utils.aoa_to_sheet(roleRows);
@@ -1263,23 +1378,19 @@ function excelWorkbookFromDocs(docs) {
     XLSX.utils.book_append_sheet(wb, ws_, "Status Access Roles");
   }
 
-  const mandateRows = [["Ticket Key", "Status", "Mandatory Images", "Mandatory Comments", "Mandatory New Assignee", "New Assignee Role"]];
+  const mandateRows = [["Ticket Key", "Ticket Subtype", "Status", "Mandatory Images", "Mandatory Comments", "Mandatory New Assignee", "New Assignee Role"]];
   list.forEach((doc) => {
-    const mandateMap = new Map();
-    doc.ticketSubType.forEach((s) => s.statusWorkFlow.forEach((st) => {
-      const code = xToStatusCode(st.status);
-      if (mandateMap.has(code)) return;
+    pushStatusBlocks(mandateRows, doc, statusBlocks(doc, (s) => s.statusWorkFlow.map((st) => {
       const mand = st.mandatoryCustomFields || [];
       const commentField = (st.customFieldsMetaData || []).find((f) => mand.includes(f.key));
-      mandateMap.set(code, {
-        label: st.label || st.status,
-        images: mand.includes("images") ? "Yes" : "No",
-        comments: commentField ? commentField.label + (commentField.type && commentField.type !== "text" ? ` (${commentField.type})` : "") : (mand.includes("comments") ? "Yes" : "No"),
-        newAssignee: mand.includes("newAssignee") ? "Yes" : "No",
-        newAssigneeRole: (st.assigneeRoles || []).join(", "),
-      });
-    }));
-    mandateMap.forEach((v) => mandateRows.push([doc.ticketKey, v.label, v.images, v.comments, v.newAssignee, v.newAssigneeRole]));
+      return [
+        st.label || st.status,
+        mand.includes("images") ? "Yes" : "No",
+        commentField ? commentField.label + (commentField.type && commentField.type !== "text" ? ` (${commentField.type})` : "") : (mand.includes("comments") ? "Yes" : "No"),
+        mand.includes("newAssignee") ? "Yes" : "No",
+        (st.assigneeRoles || []).join(", "),
+      ];
+    })));
   });
   {
     const ws_ = XLSX.utils.aoa_to_sheet(mandateRows);
@@ -1357,7 +1468,7 @@ function templateFromRawJson(raw, name) {
 function templateDataFromSubType(sub) {
   return {
     prefix: sub.prefix || "",
-    isAutoEscalation: !!sub.isAutoEscalation,
+    isAutoEscalation: !!sub.isAutoEscalation || subTypeHasEscalation(sub),
     assigneeRoles: sub.assigneeRoles || [],
     customFieldsMetaData: sub.customFieldsMetaData || [],
     statusWorkFlow: sub.statusWorkFlow || [],
@@ -1767,11 +1878,64 @@ const Btn = ({ onClick, children, variant = "primary", small }) => {
     accent: "bg-gradient-to-b from-indigo-400 to-indigo-500 text-white shadow-md shadow-indigo-500/20 hover:from-indigo-300 hover:to-indigo-400 hover:shadow-indigo-400/30",
     ghost: "bg-transparent text-white hover:bg-white/5 hover:border-white/20 border border-white/10",
     dashed: "border border-dashed border-white/15 text-white hover:border-indigo-400 hover:text-indigo-300 hover:bg-indigo-500/5",
+    danger: "bg-rose-500/10 text-rose-200 border border-rose-500/40 hover:bg-rose-500/20 hover:border-rose-400",
   };
   return (
     <button type="button" onClick={onClick} className={`${base} ${size} ${styles[variant]}`}>
       {children}
     </button>
+  );
+};
+
+const Checkbox = ({ checked, onChange, title, disabled }) => (
+  <input
+    type="checkbox"
+    checked={!!checked}
+    disabled={disabled}
+    title={title}
+    onChange={(e) => onChange(e.target.checked)}
+    onClick={(e) => e.stopPropagation()}
+    className="h-4 w-4 shrink-0 cursor-pointer rounded accent-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
+  />
+);
+
+/* Bottom-right toast stack. Each toast: { id, type: "error"|"success"|"info", title, lines[] } */
+const ToastStack = ({ toasts, onDismiss }) => {
+  if (!toasts.length) return null;
+  const tones = {
+    error: { box: "border-rose-500/40 bg-[#2a1220]", icon: <AlertTriangle size={18} className="text-rose-400 mt-0.5 shrink-0" />, title: "text-rose-100" },
+    success: { box: "border-emerald-500/40 bg-[#10241c]", icon: <Check size={18} className="text-emerald-400 mt-0.5 shrink-0" />, title: "text-emerald-100" },
+    info: { box: "border-indigo-400/40 bg-[#14183a]", icon: <Sparkles size={18} className="text-indigo-300 mt-0.5 shrink-0" />, title: "text-indigo-100" },
+  };
+  return (
+    <div className="fixed bottom-5 right-5 z-50 flex w-[380px] max-w-[calc(100vw-2.5rem)] flex-col gap-2" role="status" aria-live="polite">
+      {toasts.map((t) => {
+        const tone = tones[t.type] || tones.info;
+        return (
+          <div key={t.id} className={`flex items-start gap-3 rounded-xl border px-4 py-3 shadow-2xl shadow-black/40 ${tone.box}`}>
+            {tone.icon}
+            <div className="min-w-0 flex-1">
+              <div className={`text-sm font-semibold ${tone.title}`}>{t.title}</div>
+              {t.lines && t.lines.length > 0 && (
+                <ul className="mt-1 space-y-0.5 text-xs text-white">
+                  {t.lines.map((l, i) => <li key={i} className="break-words">{l}</li>)}
+                </ul>
+              )}
+              {t.action && (
+                <button
+                  type="button"
+                  onClick={() => { t.action.onClick(); onDismiss(t.id); }}
+                  className="mt-2 rounded-lg border border-white/25 bg-white/10 px-2.5 py-1 text-xs font-medium text-white hover:bg-white/20"
+                >
+                  {t.action.label}
+                </button>
+              )}
+            </div>
+            <button type="button" onClick={() => onDismiss(t.id)} className="shrink-0 text-white/70 hover:text-white" title="Dismiss"><X size={15} /></button>
+          </div>
+        );
+      })}
+    </div>
   );
 };
 
@@ -1848,7 +2012,7 @@ const Section = ({ title, icon, children, onAdd, addLabel, right }) => (
   </div>
 );
 
-const Accordion = ({ title, subtitle, tone = "slate", defaultOpen, forceOpen, domId, onDelete, children }) => {
+const Accordion = ({ title, subtitle, tone = "slate", defaultOpen, forceOpen, domId, onDelete, select, children }) => {
   const [open, setOpen] = useState(!!defaultOpen);
   React.useEffect(() => { if (forceOpen) setOpen(true); }, [forceOpen]);
   const tones = { slate: "border-white/10", indigo: "border-indigo-500/30", amber: "border-amber-500/30" };
@@ -1856,6 +2020,7 @@ const Accordion = ({ title, subtitle, tone = "slate", defaultOpen, forceOpen, do
     <div id={domId} className={`rounded-xl border ${tones[tone]} bg-[#111528] mb-3 overflow-hidden ${forceOpen ? "ring-2 ring-indigo-400/40" : ""}`}>
       <div className="flex items-center justify-between px-3 py-2.5 cursor-pointer select-none" onClick={() => setOpen(!open)}>
         <div className="flex items-center gap-2 min-w-0">
+          {select && <Checkbox checked={select.checked} onChange={select.onChange} title="Select" />}
           {open ? <ChevronDown size={16} className="text-white shrink-0" /> : <ChevronRight size={16} className="text-white shrink-0" />}
           <div className="min-w-0">
             <div className="text-sm font-medium text-white truncate">{title}</div>
@@ -2207,8 +2372,10 @@ function AutoEscalationList({ rules, onChange }) {
           </div>
           <div className="grid grid-cols-3 gap-2 mb-2">
             <div>
-              <Label mono>Assignee role</Label>
-              <Input mono value={r.assignee} onChange={(v) => update(r.id, { assignee: v })} placeholder="Dist_Mgr" />
+              <Label mono hint="Required">Assignee role *</Label>
+              <div className={xnorm(r.assignee) ? "" : "rounded-xl ring-1 ring-rose-500/60"}>
+                <Input mono value={r.assignee} onChange={(v) => update(r.id, { assignee: v })} placeholder="Dist_Mgr" />
+              </div>
             </div>
             <div>
               <Label>Days</Label>
@@ -2349,7 +2516,7 @@ function StatusPipelinePreview({ statuses }) {
 /* Sub-type editor                                                     */
 /* ------------------------------------------------------------------ */
 
-function SubTypeEditor({ sub, onChange, onDelete, forceOpen }) {
+function SubTypeEditor({ sub, onChange, onDelete, forceOpen, select }) {
   const [tab, setTab] = useState("basic");
   const tabs = [
     { id: "basic", label: "Basic" },
@@ -2363,6 +2530,7 @@ function SubTypeEditor({ sub, onChange, onDelete, forceOpen }) {
       domId={`subtype-${sub.id}`}
       forceOpen={forceOpen}
       onDelete={onDelete}
+      select={select}
     >
       <div className="flex gap-1 mb-4 border-b border-white/10">
         {tabs.map((t) => (
@@ -2399,8 +2567,15 @@ function SubTypeEditor({ sub, onChange, onDelete, forceOpen }) {
           </div>
           <div className="flex gap-6">
             <Toggle checked={sub.deleted} onChange={(v) => onChange({ ...sub, deleted: v })} label="Deleted" />
-            <Toggle checked={sub.isAutoEscalation} onChange={(v) => onChange({ ...sub, isAutoEscalation: v })} label="Auto-escalation enabled" />
+            <Toggle
+              checked={sub.isAutoEscalation || subTypeHasEscalation(sub)}
+              onChange={(v) => { if (!v && subTypeHasEscalation(sub)) return; onChange({ ...sub, isAutoEscalation: v }); }}
+              label="Auto-escalation enabled"
+            />
           </div>
+          {subTypeHasEscalation(sub) && (
+            <p className="mt-2 text-xs text-white/70">Always on while this sub-type has escalation rules (Status Workflow tab). Remove the rules to switch it off.</p>
+          )}
         </div>
       )}
 
@@ -2415,7 +2590,11 @@ function SubTypeEditor({ sub, onChange, onDelete, forceOpen }) {
             <StatusEditor
               key={s.id}
               status={s}
-              onChange={(patch) => onChange({ ...sub, statusWorkFlow: sub.statusWorkFlow.map((x) => (x.id === s.id ? patch : x)) })}
+              onChange={(patch) => {
+                const next = { ...sub, statusWorkFlow: sub.statusWorkFlow.map((x) => (x.id === s.id ? patch : x)) };
+                // adding an escalation rule switches auto-escalation on for the sub-type
+                onChange(subTypeHasEscalation(next) ? { ...next, isAutoEscalation: true } : next);
+              }}
               onDelete={() => onChange({ ...sub, statusWorkFlow: sub.statusWorkFlow.filter((x) => x.id !== s.id) })}
             />
           ))}
@@ -3234,12 +3413,18 @@ function RolesTab({ doc, onChange }) {
   return (
     <div className="max-w-2xl space-y-5">
       <div>
-        <Label>Creators — roles allowed to raise this ticket</Label>
-        <TagInput values={doc.creators} onChange={(v) => onChange({ ...doc, creators: v })} placeholder="e.g. merchandiseanalyst — press enter" tone="indigo" />
+        <Label hint="Required — export is blocked until at least one role is added">Creators * — roles allowed to raise this ticket</Label>
+        <div className={doc.creators.length ? "" : "rounded-xl ring-1 ring-rose-500/60"}>
+          <TagInput values={doc.creators} onChange={(v) => onChange({ ...doc, creators: v })} placeholder="e.g. merchandiseanalyst — press enter" tone="indigo" />
+        </div>
+        {!doc.creators.length && <p className="mt-1 text-xs text-rose-300">Add at least one creator role.</p>}
       </div>
       <div>
-        <Label>Viewers — roles allowed to view this ticket</Label>
-        <TagInput values={doc.viewers} onChange={(v) => onChange({ ...doc, viewers: v })} placeholder="e.g. vendorRole — press enter" tone="indigo" />
+        <Label hint="Required — export is blocked until at least one role is added">Viewers * — roles allowed to view this ticket</Label>
+        <div className={doc.viewers.length ? "" : "rounded-xl ring-1 ring-rose-500/60"}>
+          <TagInput values={doc.viewers} onChange={(v) => onChange({ ...doc, viewers: v })} placeholder="e.g. vendorRole — press enter" tone="indigo" />
+        </div>
+        {!doc.viewers.length && <p className="mt-1 text-xs text-rose-300">Add at least one viewer role.</p>}
       </div>
       <div>
         <Label>Assignees — roles this ticket can be routed to</Label>
@@ -3253,11 +3438,17 @@ function RolesTab({ doc, onChange }) {
 /* JSON tab                                                             */
 /* ------------------------------------------------------------------ */
 
-function JsonTab({ doc }) {
+function JsonTab({ doc, onBeforeExport }) {
   const [copied, setCopied] = useState(false);
   const json = useMemo(() => JSON.stringify(docToJson(doc) || {}, null, 2), [doc]);
+  const missing = missingRequiredRoles(doc);
+  const problems = [
+    ...(missing.length ? [`${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} required but empty (Roles tab)`] : []),
+    ...assigneeProblems(doc).map((p) => p.text),
+  ];
 
   const copy = async () => {
+    if (onBeforeExport && !onBeforeExport()) return;
     try {
       await navigator.clipboard.writeText(json);
       setCopied(true);
@@ -3266,6 +3457,7 @@ function JsonTab({ doc }) {
   };
 
   const download = () => {
+    if (onBeforeExport && !onBeforeExport()) return;
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -3277,6 +3469,15 @@ function JsonTab({ doc }) {
 
   return (
     <div>
+      {problems.length > 0 && (
+        <div className="mb-3 flex items-start gap-2 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+          <AlertTriangle size={16} className="mt-0.5 shrink-0 text-rose-400" />
+          <div>
+            <div className="font-medium">Copy and Download are blocked until this is fixed:</div>
+            <ul className="mt-1 list-disc space-y-0.5 pl-4 text-xs">{problems.map((p, i) => <li key={i}>{p}</li>)}</ul>
+          </div>
+        </div>
+      )}
       <div className="flex items-center justify-between mb-3">
         <p className="text-sm text-white">Fields left blank are automatically left out of the generated JSON.</p>
         <div className="flex gap-2">
@@ -3301,9 +3502,11 @@ function matchesTerm(text, term) {
   return xnorm(text).toLowerCase().includes(term.toLowerCase());
 }
 
-function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew, onDuplicate, onDelete, onExportAll }) {
+function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew, onDuplicate, onDelete, onBulkDelete, onExportAll }) {
   const [term, setTerm] = useState("");
   const [expanded, setExpanded] = useState({});
+  const [pickedTypes, setPickedTypes] = useState(() => new Set()); // ticket type _uid
+  const [pickedSubs, setPickedSubs] = useState(() => new Set()); // `${_uid}::${sub.id}`
 
   const rows = library.map((d) => {
     const selfMatch = !term || matchesTerm(d.ticketType, term) || matchesTerm(d.ticketKey, term);
@@ -3311,6 +3514,20 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
     const show = !term || selfMatch || subMatches.length > 0;
     return { d, selfMatch, subMatches, show };
   }).filter((r) => r.show);
+
+  // Selection is derived against the live library so stale picks (after a delete/import) never count.
+  const liveTypeUids = new Set(library.map((d) => d._uid));
+  const typeUids = [...pickedTypes].filter((u) => liveTypeUids.has(u));
+  const subPicks = [];
+  library.forEach((d) => {
+    if (pickedTypes.has(d._uid)) return; // the whole type goes, its sub-types are implied
+    d.ticketSubType.forEach((s) => { if (pickedSubs.has(`${d._uid}::${s.id}`)) subPicks.push({ uid: d._uid, subId: s.id }); });
+  });
+  const allVisibleTypesPicked = rows.length > 0 && rows.every(({ d }) => pickedTypes.has(d._uid));
+  const toggle = (setter, key, on) => setter((prev) => { const next = new Set(prev); if (on) next.add(key); else next.delete(key); return next; });
+  const clearPicks = () => { setPickedTypes(new Set()); setPickedSubs(new Set()); };
+  const toggleAllVisible = (on) => setPickedTypes((prev) => { const next = new Set(prev); rows.forEach(({ d }) => (on ? next.add(d._uid) : next.delete(d._uid))); return next; });
+  const deleteSelected = () => { if (onBulkDelete({ typeUids, subs: subPicks })) clearPicks(); };
 
   return (
     <div>
@@ -3333,13 +3550,37 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
         </div>
       )}
 
+      {rows.length > 0 && (
+        <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-[#0D1220] px-4 py-2.5">
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-white">
+            <Checkbox checked={allVisibleTypesPicked} onChange={toggleAllVisible} title="Select all ticket types" />
+            Select all ticket types
+          </label>
+          {(typeUids.length > 0 || subPicks.length > 0) ? (
+            <>
+              <span className="text-sm text-indigo-200">
+                {[typeUids.length ? `${typeUids.length} ticket type${typeUids.length === 1 ? "" : "s"}` : "", subPicks.length ? `${subPicks.length} sub-type${subPicks.length === 1 ? "" : "s"}` : ""].filter(Boolean).join(" + ")} selected
+              </span>
+              <div className="ml-auto flex items-center gap-2">
+                <Btn variant="ghost" small onClick={clearPicks}>Clear</Btn>
+                <Btn variant="danger" small onClick={deleteSelected}><Trash2 size={13} />Delete selected</Btn>
+              </div>
+            </>
+          ) : (
+            <span className="text-xs text-white/70">Tick ticket types, or expand one and tick its sub-types, to delete several at once.</span>
+          )}
+        </div>
+      )}
+
       <div className="space-y-2">
         {rows.map(({ d, subMatches }) => {
           const isSelected = d._uid === selectedUid;
           const isOpen = term ? subMatches.length > 0 : !!expanded[d._uid];
+          const typePicked = pickedTypes.has(d._uid);
           return (
-            <div key={d._uid} className={`rounded-xl border bg-[#111528] overflow-hidden ${isSelected ? "border-indigo-500/50" : "border-white/10"}`}>
+            <div key={d._uid} className={`rounded-xl border bg-[#111528] overflow-hidden ${typePicked ? "border-rose-400/50" : isSelected ? "border-indigo-500/50" : "border-white/10"}`}>
               <div className="flex items-center gap-3 px-4 py-3">
+                <Checkbox checked={typePicked} onChange={(on) => toggle(setPickedTypes, d._uid, on)} title="Select this ticket type" />
                 <button
                   onClick={() => setExpanded((e) => ({ ...e, [d._uid]: !e[d._uid] }))}
                   className="text-white hover:text-white"
@@ -3359,15 +3600,19 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
                     <div className="px-4 py-2.5 text-xs text-white italic">No sub-types yet.</div>
                   )}
                   {(term ? subMatches : d.ticketSubType).map((s) => (
-                    <button
-                      key={s.id}
-                      onClick={() => onSelectSubtype(d._uid, s.id)}
-                      className="w-full flex items-center gap-2 px-4 py-2.5 pl-11 text-left hover:bg-white/5 transition"
-                    >
-                      <ListTree size={13} className="text-white shrink-0" />
-                      <span className="text-sm text-white truncate">{s.ticketType || "(untitled sub-type)"}</span>
-                      <span className="text-xs font-mono text-white truncate">{s.ticketKey}</span>
-                    </button>
+                    <div key={s.id} className="flex items-center gap-3 px-4 py-2.5 pl-11 hover:bg-white/5 transition">
+                      <Checkbox
+                        checked={typePicked || pickedSubs.has(`${d._uid}::${s.id}`)}
+                        disabled={typePicked}
+                        onChange={(on) => toggle(setPickedSubs, `${d._uid}::${s.id}`, on)}
+                        title={typePicked ? "Included because the whole ticket type is selected" : "Select this sub-type"}
+                      />
+                      <button onClick={() => onSelectSubtype(d._uid, s.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+                        <ListTree size={13} className="text-white shrink-0" />
+                        <span className="text-sm text-white truncate">{s.ticketType || "(untitled sub-type)"}</span>
+                        <span className="text-xs font-mono text-white truncate">{s.ticketKey}</span>
+                      </button>
+                    </div>
                   ))}
                 </div>
               )}
@@ -3489,11 +3734,57 @@ export default function App({ initialData } = {}) {
   const [focusSubtypeId, setFocusSubtypeId] = useState(null);
   const [templates, setTemplates] = useState([]);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [toasts, setToasts] = useState([]);
+  const [subPick, setSubPick] = useState({ uid: null, ids: [] }); // sub-types ticked on the Sub-Types tab, per ticket type
   const fileInputRef = React.useRef(null);
   const excelInputRef = React.useRef(null);
 
   const selectedIndex = library.findIndex((d) => d._uid === selectedUid);
   const selected = selectedIndex >= 0 ? library[selectedIndex] : null;
+
+  const dismissToast = (id) => setToasts((prev) => prev.filter((t) => t.id !== id));
+  const showToast = ({ type = "info", title, lines = [], duration, action }) => {
+    const id = uid();
+    setToasts((prev) => [...prev.slice(-3), { id, type, title, lines, action }]);
+    setTimeout(() => dismissToast(id), duration || (type === "error" ? (action ? 20000 : 9000) : 4500));
+  };
+
+  // Add the roles a workflow uses to both the sub-type's and the ticket type's assignee roles.
+  const fixAssigneeRoles = (uids) => {
+    setLibrary((lib) => lib.map((d) => (uids.includes(d._uid) ? syncAssigneeRoles(d) : d)));
+    showToast({ type: "success", title: "Assignee roles updated", lines: ["The roles used by statuses and escalation levels were added to the sub-type and ticket type. Export again."] });
+  };
+
+  // Required before any export: creators + viewers on every ticket type, and the assignee-role rules.
+  const checkDocsForExport = (docs, { goToRoles = false } = {}) => {
+    const lines = [];
+    const rolesFirst = [];
+    const fixableUids = [];
+    docs.forEach((d) => {
+      const label = d.ticketType || d.ticketKey || "(untitled ticket type)";
+      const missing = missingRequiredRoles(d);
+      if (missing.length) { lines.push(`${label}: ${missing.join(" and ")} ${missing.length === 1 ? "is" : "are"} not set`); rolesFirst.push(d); }
+      assigneeProblems(d).forEach((p) => {
+        lines.push(`${label} › ${p.text}`);
+        if (p.fixable && !fixableUids.includes(d._uid)) fixableUids.push(d._uid);
+      });
+    });
+    if (!lines.length) return true;
+    showToast({
+      type: "error",
+      title: "Export blocked — fix these first",
+      lines,
+      action: fixableUids.length ? { label: "Add the missing assignee roles", onClick: () => fixAssigneeRoles(fixableUids) } : undefined,
+    });
+    if (goToRoles && docs.length === 1 && rolesFirst.length === 1) { setSelectedUid(rolesFirst[0]._uid); setTab("roles"); }
+    return false;
+  };
+
+  // Ticks only count for the ticket type they were made on (and only for sub-types that still exist).
+  const pickedSubIds = new Set(
+    subPick.uid === selectedUid && selected ? subPick.ids.filter((id) => selected.ticketSubType.some((s) => s.id === id)) : [],
+  );
+  const setPickedSubIds = (ids) => setSubPick({ uid: selectedUid, ids: [...ids] });
 
   const updateSelected = (patch) => {
     if (selectedIndex < 0) return;
@@ -3562,6 +3853,7 @@ export default function App({ initialData } = {}) {
 
   const exportSelectedToExcel = () => {
     if (!selected) { window.alert("Pick a ticket type first (from Ticket Types) before exporting."); return; }
+    if (!checkDocsForExport([selected], { goToRoles: true })) return;
     const { wb, skippedFields } = excelWorkbookFromDocs([selected]);
     XLSX.writeFile(wb, `${selected.ticketKey || "ticket-type"}.xlsx`);
     if (skippedFields.length) {
@@ -3575,6 +3867,7 @@ export default function App({ initialData } = {}) {
 
   const exportAllToExcel = () => {
     if (!library.length) { window.alert("Nothing to export yet — import or create a ticket type first."); return; }
+    if (!checkDocsForExport(library)) return;
     const { wb, skippedFields } = excelWorkbookFromDocs(library);
     XLSX.writeFile(wb, "ticket-types.xlsx");
     if (skippedFields.length) {
@@ -3587,6 +3880,7 @@ export default function App({ initialData } = {}) {
   };
 
   const exportAll = () => {
+    if (!checkDocsForExport(library)) return;
     const json = JSON.stringify({ result: library.map(docToJson) }, null, 2);
     const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -3614,7 +3908,12 @@ export default function App({ initialData } = {}) {
     // it's a new entity — don't carry over backend-only passthrough fields
     // (e.g. _id) from the source, those belong to the original record only
     copy._passthrough = {};
-    copy.ticketSubType = copy.ticketSubType.map((s) => ({ ...s, _passthrough: {} }));
+    // ...and every escalation level of the copy gets its own uuid
+    copy.ticketSubType = copy.ticketSubType.map((s) => ({
+      ...s,
+      _passthrough: {},
+      statusWorkFlow: s.statusWorkFlow.map((w) => ({ ...w, autoEscalationConfig: w.autoEscalationConfig.map((e) => ({ ...e, _id: uuidv4() })) })),
+    }));
     setLibrary([...library, copy]);
     setSelectedUid(copy._uid);
     setTab("details");
@@ -3626,6 +3925,32 @@ export default function App({ initialData } = {}) {
     if (!window.confirm(`Delete ticket type "${target.ticketType || target.ticketKey || "(unnamed)"}" and all its sub-types? This can't be undone.`)) return;
     setLibrary(library.filter((d) => d._uid !== uidVal));
     if (selectedUid === uidVal) { setSelectedUid(null); setTab("library"); }
+  };
+
+  /* Delete several ticket types and/or sub-types in one go (one confirmation).
+     Returns true when something was deleted so the caller can clear its ticks. */
+  const bulkDelete = ({ typeUids = [], subs = [] }) => {
+    const typeSet = new Set(typeUids);
+    const subMap = {};
+    subs.forEach(({ uid: u, subId }) => { if (!typeSet.has(u)) (subMap[u] = subMap[u] || new Set()).add(subId); });
+    const subCount = Object.values(subMap).reduce((n, s) => n + s.size, 0);
+    const typeSubCount = library.filter((d) => typeSet.has(d._uid)).reduce((n, d) => n + d.ticketSubType.length, 0);
+    if (!typeSet.size && !subCount) return false;
+    const parts = [];
+    if (typeSet.size) parts.push(`${typeSet.size} ticket type${typeSet.size === 1 ? "" : "s"} (with ${typeSubCount} sub-type${typeSubCount === 1 ? "" : "s"})`);
+    if (subCount) parts.push(`${subCount} sub-type${subCount === 1 ? "" : "s"}`);
+    if (!window.confirm(`Delete ${parts.join(" and ")}? This can't be undone.`)) return false;
+    setLibrary(library
+      .filter((d) => !typeSet.has(d._uid))
+      .map((d) => (subMap[d._uid] ? { ...d, ticketSubType: d.ticketSubType.filter((s) => !subMap[d._uid].has(s.id)) } : d)));
+    if (typeSet.has(selectedUid)) { setSelectedUid(null); setTab("library"); }
+    showToast({ type: "success", title: `Deleted ${parts.join(" and ")}` });
+    return true;
+  };
+
+  const deletePickedSubtypes = () => {
+    if (!selected || !pickedSubIds.size) return;
+    if (bulkDelete({ subs: [...pickedSubIds].map((subId) => ({ uid: selected._uid, subId })) })) setPickedSubIds([]);
   };
 
   /* -- templates -- */
@@ -3875,6 +4200,7 @@ export default function App({ initialData } = {}) {
               onNew={newTicketType}
               onDuplicate={duplicateType}
               onDelete={deleteType}
+              onBulkDelete={bulkDelete}
               onExportAll={exportAll}
             />
           )}
@@ -3917,10 +4243,38 @@ export default function App({ initialData } = {}) {
                 />
               )}
 
+              {selected.ticketSubType.length > 0 && (
+                <div className="mb-3 flex flex-wrap items-center gap-3 rounded-xl border border-white/10 bg-[#0D1220] px-4 py-2.5">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm text-white">
+                    <Checkbox
+                      checked={pickedSubIds.size > 0 && pickedSubIds.size === selected.ticketSubType.length}
+                      onChange={(on) => setPickedSubIds(on ? selected.ticketSubType.map((s) => s.id) : [])}
+                      title="Select all sub-types"
+                    />
+                    Select all ({selected.ticketSubType.length})
+                  </label>
+                  {pickedSubIds.size > 0 ? (
+                    <>
+                      <span className="text-sm text-indigo-200">{pickedSubIds.size} selected</span>
+                      <div className="ml-auto flex items-center gap-2">
+                        <Btn variant="ghost" small onClick={() => setPickedSubIds([])}>Clear</Btn>
+                        <Btn variant="danger" small onClick={deletePickedSubtypes}><Trash2 size={13} />Delete selected</Btn>
+                      </div>
+                    </>
+                  ) : (
+                    <span className="text-xs text-white/70">Tick sub-types to delete several at once.</span>
+                  )}
+                </div>
+              )}
+
               {selected.ticketSubType.map((s) => (
                 <SubTypeEditor
                   key={s.id}
                   sub={s}
+                  select={{
+                    checked: pickedSubIds.has(s.id),
+                    onChange: (on) => setPickedSubIds(on ? [...pickedSubIds, s.id] : [...pickedSubIds].filter((x) => x !== s.id)),
+                  }}
                   forceOpen={s.id === focusSubtypeId}
                   onChange={(patch) => updateSelected({ ...selected, ticketSubType: selected.ticketSubType.map((x) => (x.id === s.id ? patch : x)) })}
                   onDelete={() => {
@@ -3932,9 +4286,10 @@ export default function App({ initialData } = {}) {
               ))}
             </div>
           )}
-          {tab === "json" && selected && <JsonTab doc={selected} />}
+          {tab === "json" && selected && <JsonTab doc={selected} onBeforeExport={() => checkDocsForExport([selected], { goToRoles: true })} />}
         </div>
       </main>
+      <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }
