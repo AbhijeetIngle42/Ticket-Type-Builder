@@ -3,7 +3,7 @@ import {
   Plus, Trash2, ChevronDown, ChevronRight, Copy, Download,
   FileJson, Users, Ticket, ListTree, Workflow, Check, X,
   GripVertical, AlertTriangle, RefreshCw, FileSpreadsheet,
-  Sparkles, LayoutTemplate, Star, Wand2, Diff
+  Sparkles, LayoutTemplate, Star, Wand2, Diff, ClipboardCopy, ClipboardPaste, Eraser
 } from "lucide-react";
 import * as XLSX from "xlsx-js-style";
 
@@ -293,14 +293,37 @@ function missingRequiredRoles(doc) {
   return missing;
 }
 
-/* Assignee roles used by a sub-type's workflow: the roles named as a status's
-   new assignee and as an escalation level's assignee. Escalation levels with
+/* The location placeholder in a sub-type prefix must be written exactly
+   "${locationId}". Any other spelling of it (${LocationId}, ${locationid},
+   ${location_id}, {locationId}, ${ locationId }) is rewritten to the exact form. */
+const PREFIX_PLACEHOLDER = "${locationId}";
+function normalizePrefix(prefix) {
+  const from = String(prefix == null ? "" : prefix);
+  const value = from.replace(/\$?\{\s*location[\s_-]?id\s*\}/gi, () => PREFIX_PLACEHOLDER);
+  return { value, changed: value !== from };
+}
+
+/* Fix every sub-type prefix of a doc. Returns the same doc object when nothing
+   needed fixing, plus a list of what changed (for the review toast). */
+function normalizeDocPrefixes(doc) {
+  const fixes = [];
+  const subs = (doc.ticketSubType || []).map((s) => {
+    const { value, changed } = normalizePrefix(s.prefix);
+    if (!changed) return s;
+    fixes.push({ ticket: doc.ticketType || doc.ticketKey || "(untitled ticket type)", sub: s.ticketType || s.ticketKey || "(untitled sub-type)", from: s.prefix, to: value });
+    return { ...s, prefix: value };
+  });
+  return fixes.length ? { doc: { ...doc, ticketSubType: subs }, fixes } : { doc, fixes };
+}
+
+/* Assignee roles that auto-escalation relies on: the assignee of each escalation
+   level. A status's own "new assignee" role is NOT included — it needs no
+   matching entry in the sub-type / ticket-type lists. Escalation levels with
    no assignee are returned separately (a level must always have one). */
 function usedAssigneeRoles(sub) {
   const roles = new Set();
   const blankLevels = [];
   (sub.statusWorkFlow || []).forEach((w) => {
-    (w.assigneeRoles || []).forEach((r) => { if (xnorm(r)) roles.add(xnorm(r)); });
     (w.autoEscalationConfig || []).forEach((e, i) => {
       const a = xnorm(e.assignee);
       if (a) roles.add(a); else blankLevels.push(`status "${w.label || w.status || "(untitled)"}" escalation level ${i + 1}`);
@@ -312,8 +335,8 @@ function usedAssigneeRoles(sub) {
 /* Rules (checked before every export):
    - every sub-type needs assignee roles, on the sub-type or the ticket type;
    - every escalation level needs an assignee role;
-   - every role used as a status assignee or escalation assignee must be listed
-     in BOTH the sub-type's and the ticket type's assignee roles.
+   - every escalation-level assignee role (only where auto-escalation exists) must
+     be listed in BOTH the sub-type's and the ticket type's assignee roles.
    Returns [{ text, fixable }]; `fixable` ones are solved by syncAssigneeRoles(). */
 function assigneeProblems(doc) {
   const out = [];
@@ -328,13 +351,13 @@ function assigneeProblems(doc) {
     const missRoot = roles.filter((r) => !root.includes(r));
     if (missSub.length || missRoot.length) {
       const where = [missSub.length ? `sub-type (${missSub.join(", ")})` : "", missRoot.length ? `ticket type (${missRoot.join(", ")})` : ""].filter(Boolean).join(" and ");
-      out.push({ fixable: true, text: `${name}: assignee roles used by the workflow are missing from the ${where}` });
+      out.push({ fixable: true, text: `${name}: escalation assignee roles are missing from the ${where}` });
     }
   });
   return out;
 }
 
-/* Adds every role a workflow uses to both the sub-type's and the ticket type's assignee roles. */
+/* Adds every escalation assignee role to both the sub-type's and the ticket type's assignee roles. */
 function syncAssigneeRoles(doc) {
   const rootAdd = [];
   const subs = (doc.ticketSubType || []).map((s) => {
@@ -672,31 +695,56 @@ function xParseStatusAccessRoles(sheet) {
 
 /* Same optional leading "Ticket Key" column convention as the roles
    sheet. Returns ticketKey -> { statusCode -> mandate rule }. */
+/* Mandate rules columns (read by header name; old files without the new
+   columns fall back to the old positions):
+     Mandatory Images | Mandatory Comments | Comment Field Label | Comment Field Type | Mandatory New Assignee | New Assignee Role
+   Be forgiving about how people fill them in: "Yes (anything)" still counts
+   as Yes, "No / N/A / -" in a role cell means no role, and the old style of
+   putting the label itself in "Mandatory Comments" ("Rejection Remarks",
+   "STO No. (Number)" or "Yes (Rejection Remarks)") keeps working. */
+const xYesish = (v) => /^(yes|y|true|1)(\s|\(|$)/i.test(xnorm(v));
+const xNoish = (v) => ["", "no", "n", "false", "0", "na", "n/a", "-", "none"].includes(xnorm(v).toLowerCase());
+
 function xParseMandateRules(sheet) {
-  const { offset, items } = xStatusSheetRows(sheet);
+  const { headerRow, offset, items } = xStatusSheetRows(sheet);
+  const find = (test, fallback) => { const i = headerRow.findIndex(test); return i >= 0 ? i : fallback; };
+  const imagesCol = find((h) => h.includes("image"), offset + 1);
+  const commentsCol = find((h) => h.includes("comment") && !h.includes("label") && !h.includes("type"), offset + 2);
+  const labelCol = find((h) => h.includes("comment") && h.includes("label"), -1);
+  const typeCol = find((h) => h.includes("comment") && h.includes("type"), -1);
+  const assigneeYnCol = find((h) => h.includes("assignee") && !h.includes("role"), offset + 3);
+  const roleCol = find((h) => h.includes("assignee") && h.includes("role"), offset + 4);
   const byTicket = {};
   for (const { scope: ticketKey, r, label } of items) {
-    const imagesCell = xnorm(xCell(r, offset + 1));
-    const commentsCell = xnorm(xCell(r, offset + 2));
-    const assigneeYnCell = xnorm(xCell(r, offset + 3));
-    const assigneeRoleCell = xnorm(xCell(r, offset + 4));
-    // The exporter writes an explicit "No" for statuses without a remark field;
-    // that must read back as "not mandatory", not as a field labelled "No".
-    const commentsOff = ["no", "n", "false", "0"].includes(commentsCell.toLowerCase());
-    let commentsLabel = commentsCell && !commentsOff && !xIsYes(commentsCell) ? commentsCell : "Comments";
-    commentsLabel = commentsLabel.replace(/\(mandatory\)/i, "").trim();
-    // optional "(Number)" / "(Date)" / "(Text)" suffix sets the remark field's type
-    const typeMatch = commentsLabel.match(/\((text|number|date)\)\s*$/i);
-    const commentsType = typeMatch ? typeMatch[1].toLowerCase() : "text";
-    if (typeMatch) commentsLabel = commentsLabel.replace(/\((text|number|date)\)\s*$/i, "").trim();
+    const imagesCell = xnorm(xCell(r, imagesCol));
+    const commentsCell = xnorm(xCell(r, commentsCol));
+    const labelCell = labelCol >= 0 ? xnorm(xCell(r, labelCol)) : "";
+    const typeCell = typeCol >= 0 ? xnorm(xCell(r, typeCol)).toLowerCase() : "";
+    const assigneeYnCell = xnorm(xCell(r, assigneeYnCol));
+    const roleCell = xnorm(xCell(r, roleCol));
+
+    // "No" (written by the exporter) must read back as "not mandatory", never as a field labelled "No"
+    const commentsOff = xNoish(commentsCell) && !labelCell;
+    let rawLabel = labelCell;
+    if (!rawLabel && !commentsOff) {
+      const bracket = commentsCell.match(/^(?:yes|y|true)\s*\((.+)\)\s*$/i); // "Yes (Rejection Remarks)"
+      if (bracket) rawLabel = bracket[1];
+      else if (!xYesish(commentsCell)) rawLabel = commentsCell;               // "Rejection Remarks"
+    }
+    rawLabel = rawLabel.replace(/\(mandatory\)/i, "").trim();
+    // a "(Number)" / "(Date)" / "(Text)" suffix on the label sets the remark field's type
+    const typeMatch = rawLabel.match(/\((text|number|date)\)\s*$/i);
+    if (typeMatch) rawLabel = rawLabel.replace(/\((text|number|date)\)\s*$/i, "").trim();
+    const commentsType = ["text", "number", "date"].includes(typeCell) ? typeCell : (typeMatch ? typeMatch[1].toLowerCase() : "text");
+
     byTicket[ticketKey] = byTicket[ticketKey] || {};
     byTicket[ticketKey][xToStatusCode(label)] = {
-      mandatoryImages: xIsYes(imagesCell),
-      mandatoryComments: !commentsOff && (xIsYes(commentsCell) || !!commentsCell),
-      commentsLabel,
+      mandatoryImages: xYesish(imagesCell),
+      mandatoryComments: !commentsOff,
+      commentsLabel: rawLabel || "Comments",
       commentsType,
-      mandatoryNewAssignee: xIsYes(assigneeYnCell),
-      newAssigneeRole: assigneeRoleCell,
+      mandatoryNewAssignee: xYesish(assigneeYnCell),
+      newAssigneeRole: xNoish(roleCell) ? "" : roleCell,
     };
   }
   return byTicket;
@@ -1378,7 +1426,7 @@ function excelWorkbookFromDocs(docs) {
     XLSX.utils.book_append_sheet(wb, ws_, "Status Access Roles");
   }
 
-  const mandateRows = [["Ticket Key", "Ticket Subtype", "Status", "Mandatory Images", "Mandatory Comments", "Mandatory New Assignee", "New Assignee Role"]];
+  const mandateRows = [["Ticket Key", "Ticket Subtype", "Status", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role"]];
   list.forEach((doc) => {
     pushStatusBlocks(mandateRows, doc, statusBlocks(doc, (s) => s.statusWorkFlow.map((st) => {
       const mand = st.mandatoryCustomFields || [];
@@ -1386,7 +1434,9 @@ function excelWorkbookFromDocs(docs) {
       return [
         st.label || st.status,
         mand.includes("images") ? "Yes" : "No",
-        commentField ? commentField.label + (commentField.type && commentField.type !== "text" ? ` (${commentField.type})` : "") : (mand.includes("comments") ? "Yes" : "No"),
+        commentField || mand.includes("comments") ? "Yes" : "No",
+        commentField ? commentField.label : "",
+        commentField ? (commentField.type || "text") : "",
         mand.includes("newAssignee") ? "Yes" : "No",
         (st.assigneeRoles || []).join(", "),
       ];
@@ -1904,6 +1954,7 @@ const ToastStack = ({ toasts, onDismiss }) => {
   if (!toasts.length) return null;
   const tones = {
     error: { box: "border-rose-500/40 bg-[#2a1220]", icon: <AlertTriangle size={18} className="text-rose-400 mt-0.5 shrink-0" />, title: "text-rose-100" },
+    warning: { box: "border-amber-500/40 bg-[#2b2110]", icon: <AlertTriangle size={18} className="text-amber-400 mt-0.5 shrink-0" />, title: "text-amber-100" },
     success: { box: "border-emerald-500/40 bg-[#10241c]", icon: <Check size={18} className="text-emerald-400 mt-0.5 shrink-0" />, title: "text-emerald-100" },
     info: { box: "border-indigo-400/40 bg-[#14183a]", icon: <Sparkles size={18} className="text-indigo-300 mt-0.5 shrink-0" />, title: "text-indigo-100" },
   };
@@ -2012,7 +2063,7 @@ const Section = ({ title, icon, children, onAdd, addLabel, right }) => (
   </div>
 );
 
-const Accordion = ({ title, subtitle, tone = "slate", defaultOpen, forceOpen, domId, onDelete, select, children }) => {
+const Accordion = ({ title, subtitle, tone = "slate", defaultOpen, forceOpen, domId, onDelete, onCopy, select, children }) => {
   const [open, setOpen] = useState(!!defaultOpen);
   React.useEffect(() => { if (forceOpen) setOpen(true); }, [forceOpen]);
   const tones = { slate: "border-white/10", indigo: "border-indigo-500/30", amber: "border-amber-500/30" };
@@ -2027,11 +2078,18 @@ const Accordion = ({ title, subtitle, tone = "slate", defaultOpen, forceOpen, do
             {subtitle && <div className="text-xs text-white font-mono truncate">{subtitle}</div>}
           </div>
         </div>
+        <div className="flex items-center gap-0.5 shrink-0">
+        {onCopy && (
+          <IconBtn title="Copy (paste it into another ticket type)" onClick={(e) => { e.stopPropagation(); onCopy(); }}>
+            <ClipboardCopy size={14} />
+          </IconBtn>
+        )}
         {onDelete && (
           <IconBtn danger title="Remove" onClick={(e) => { e.stopPropagation(); onDelete(); }}>
             <Trash2 size={14} />
           </IconBtn>
         )}
+        </div>
       </div>
       {open && <div className="px-3 pb-3 pt-1 border-t border-white/5">{children}</div>}
     </div>
@@ -2516,7 +2574,7 @@ function StatusPipelinePreview({ statuses }) {
 /* Sub-type editor                                                     */
 /* ------------------------------------------------------------------ */
 
-function SubTypeEditor({ sub, onChange, onDelete, forceOpen, select }) {
+function SubTypeEditor({ sub, onChange, onDelete, onCopy, forceOpen, select }) {
   const [tab, setTab] = useState("basic");
   const tabs = [
     { id: "basic", label: "Basic" },
@@ -2530,6 +2588,7 @@ function SubTypeEditor({ sub, onChange, onDelete, forceOpen, select }) {
       domId={`subtype-${sub.id}`}
       forceOpen={forceOpen}
       onDelete={onDelete}
+      onCopy={onCopy}
       select={select}
     >
       <div className="flex gap-1 mb-4 border-b border-white/10">
@@ -2553,7 +2612,7 @@ function SubTypeEditor({ sub, onChange, onDelete, forceOpen, select }) {
               <Input mono value={sub.ticketKey} onChange={(v) => onChange({ ...sub, ticketKey: v })} placeholder="e.g. StockGap" />
             </div>
             <div>
-              <Label mono hint="Template for the ticket ID this sub-type generates">Prefix</Label>
+              <Label mono hint="Ticket ID template — write the location placeholder exactly as ${locationId} (fixed automatically)">Prefix</Label>
               <Input mono value={sub.prefix} onChange={(v) => onChange({ ...sub, prefix: v })} placeholder="e.g. ${locationId}" />
             </div>
           </div>
@@ -3502,7 +3561,7 @@ function matchesTerm(text, term) {
   return xnorm(text).toLowerCase().includes(term.toLowerCase());
 }
 
-function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew, onDuplicate, onDelete, onBulkDelete, onExportAll }) {
+function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew, onDuplicate, onDelete, onBulkDelete, onExportAll, clip, onCopySubs, onPasteSubs }) {
   const [term, setTerm] = useState("");
   const [expanded, setExpanded] = useState({});
   const [pickedTypes, setPickedTypes] = useState(() => new Set()); // ticket type _uid
@@ -3528,6 +3587,14 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
   const clearPicks = () => { setPickedTypes(new Set()); setPickedSubs(new Set()); };
   const toggleAllVisible = (on) => setPickedTypes((prev) => { const next = new Set(prev); rows.forEach(({ d }) => (on ? next.add(d._uid) : next.delete(d._uid))); return next; });
   const deleteSelected = () => { if (onBulkDelete({ typeUids, subs: subPicks })) clearPicks(); };
+  // Copy everything ticked: whole ticket types contribute all their sub-types.
+  const copySelected = () => {
+    const picked = [
+      ...library.filter((d) => pickedTypes.has(d._uid)).flatMap((d) => d.ticketSubType.map((s) => ({ s, from: d.ticketType || d.ticketKey }))),
+      ...subPicks.map(({ uid: u, subId }) => { const d = library.find((x) => x._uid === u); return { s: d.ticketSubType.find((x) => x.id === subId), from: d.ticketType || d.ticketKey }; }),
+    ].filter((p) => p.s);
+    onCopySubs(picked.map((p) => p.s), [...new Set(picked.map((p) => p.from))].join(", "));
+  };
 
   return (
     <div>
@@ -3563,11 +3630,12 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
               </span>
               <div className="ml-auto flex items-center gap-2">
                 <Btn variant="ghost" small onClick={clearPicks}>Clear</Btn>
+                <Btn variant="ghost" small onClick={copySelected}><ClipboardCopy size={13} />Copy sub-types</Btn>
                 <Btn variant="danger" small onClick={deleteSelected}><Trash2 size={13} />Delete selected</Btn>
               </div>
             </>
           ) : (
-            <span className="text-xs text-white/70">Tick ticket types, or expand one and tick its sub-types, to delete several at once.</span>
+            <span className="text-xs text-white/70">Tick ticket types, or expand one and tick its sub-types, to copy or delete several at once.</span>
           )}
         </div>
       )}
@@ -3591,7 +3659,9 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
                   <div className="text-sm font-medium text-white truncate">{d.ticketType || "(untitled ticket type)"}</div>
                   <div className="text-xs font-mono text-white truncate">{d.ticketKey || "no key"} · {d.ticketSubType.length} sub-type{d.ticketSubType.length === 1 ? "" : "s"}</div>
                 </button>
-                <IconBtn title="Duplicate" onClick={() => onDuplicate(d._uid)}><Copy size={14} /></IconBtn>
+                <IconBtn title="Copy all its sub-types (then paste into another ticket type)" onClick={() => onCopySubs(d.ticketSubType, d.ticketType || d.ticketKey)}><ClipboardCopy size={14} /></IconBtn>
+                {clip && <IconBtn title={`Paste ${clip.subs.length} copied sub-type${clip.subs.length === 1 ? "" : "s"} here`} onClick={() => onPasteSubs(d._uid)}><ClipboardPaste size={14} /></IconBtn>}
+                <IconBtn title="Duplicate ticket type" onClick={() => onDuplicate(d._uid)}><Copy size={14} /></IconBtn>
                 <IconBtn danger title="Delete ticket type" onClick={() => onDelete(d._uid)}><Trash2 size={14} /></IconBtn>
               </div>
               {isOpen && (
@@ -3612,6 +3682,7 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
                         <span className="text-sm text-white truncate">{s.ticketType || "(untitled sub-type)"}</span>
                         <span className="text-xs font-mono text-white truncate">{s.ticketKey}</span>
                       </button>
+                      <IconBtn title="Copy this sub-type" onClick={() => onCopySubs([s], d.ticketType || d.ticketKey)}><ClipboardCopy size={14} /></IconBtn>
                     </div>
                   ))}
                 </div>
@@ -3735,6 +3806,7 @@ export default function App({ initialData } = {}) {
   const [templates, setTemplates] = useState([]);
   const [bulkOpen, setBulkOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
+  const [clip, setClip] = useState(null); // { subs, from } — sub-types copied, ready to paste into any ticket type
   const [subPick, setSubPick] = useState({ uid: null, ids: [] }); // sub-types ticked on the Sub-Types tab, per ticket type
   const fileInputRef = React.useRef(null);
   const excelInputRef = React.useRef(null);
@@ -3749,10 +3821,10 @@ export default function App({ initialData } = {}) {
     setTimeout(() => dismissToast(id), duration || (type === "error" ? (action ? 20000 : 9000) : 4500));
   };
 
-  // Add the roles a workflow uses to both the sub-type's and the ticket type's assignee roles.
+  // Add the escalation assignee roles to both the sub-type's and the ticket type's assignee roles.
   const fixAssigneeRoles = (uids) => {
     setLibrary((lib) => lib.map((d) => (uids.includes(d._uid) ? syncAssigneeRoles(d) : d)));
-    showToast({ type: "success", title: "Assignee roles updated", lines: ["The roles used by statuses and escalation levels were added to the sub-type and ticket type. Export again."] });
+    showToast({ type: "success", title: "Assignee roles updated", lines: ["The escalation assignee roles were added to the sub-type and ticket type. Export again."] });
   };
 
   // Required before any export: creators + viewers on every ticket type, and the assignee-role rules.
@@ -3786,9 +3858,26 @@ export default function App({ initialData } = {}) {
   );
   const setPickedSubIds = (ids) => setSubPick({ uid: selectedUid, ids: [...ids] });
 
+  // Soft heads-up (amber, auto-dismisses) after prefixes were rewritten to ${locationId}.
+  const notifyPrefixFixes = (fixes) => {
+    if (!fixes.length) return;
+    showToast({
+      type: "warning",
+      title: `Prefix corrected in ${fixes.length} sub-type${fixes.length === 1 ? "" : "s"} — please review`,
+      lines: [
+        `The location placeholder must be written exactly as ${PREFIX_PLACEHOLDER}.`,
+        ...fixes.slice(0, 5).map((f) => `${f.ticket} › ${f.sub}: "${f.from}" → "${f.to}"`),
+        ...(fixes.length > 5 ? [`…and ${fixes.length - 5} more`] : []),
+      ],
+      duration: 9000,
+    });
+  };
+
   const updateSelected = (patch) => {
     if (selectedIndex < 0) return;
-    setLibrary(library.map((d, i) => (i === selectedIndex ? { ...patch, _uid: d._uid } : d)));
+    const { doc: fixedDoc, fixes } = normalizeDocPrefixes(patch);
+    setLibrary(library.map((d, i) => (i === selectedIndex ? { ...fixedDoc, _uid: d._uid } : d)));
+    notifyPrefixFixes(fixes);
   };
 
   const selectType = (uidVal) => { setSelectedUid(uidVal); setFocusSubtypeId(null); setTab("details"); };
@@ -3810,9 +3899,11 @@ export default function App({ initialData } = {}) {
     reader.onload = () => {
       try {
         const rawDocs = extractRawDocs(JSON.parse(reader.result));
-        const incomingDocs = rawDocs.map(jsonToDoc);
+        const prefixFixes = [];
+        const incomingDocs = rawDocs.map(jsonToDoc).map((d) => { const r = normalizeDocPrefixes(d); prefixFixes.push(...r.fixes); return r.doc; });
         const { library: nextLibrary, newTypes, updatedTypes } = importDocsIntoLibrary(library, incomingDocs);
         setLibrary(nextLibrary);
+        notifyPrefixFixes(prefixFixes);
         const notes = [];
         if (newTypes.length) notes.push(`New ticket type(s): ${newTypes.join(", ")}`);
         if (updatedTypes.length) notes.push(...updatedTypes.map((t) => `Updated: ${t}`));
@@ -3834,9 +3925,12 @@ export default function App({ initialData } = {}) {
     reader.onload = () => {
       try {
         const wb = XLSX.read(reader.result, { type: "array" });
-        const { docs: parsedDocs, warnings, missingSheets } = excelWorkbookToDocs(wb);
+        const { docs: rawParsedDocs, warnings, missingSheets } = excelWorkbookToDocs(wb);
+        const prefixFixes = [];
+        const parsedDocs = rawParsedDocs.map((d) => { const r = normalizeDocPrefixes(d); prefixFixes.push(...r.fixes); return r.doc; });
         const { library: nextLibrary, newTypes, updatedTypes } = importDocsIntoLibrary(library, parsedDocs);
         setLibrary(nextLibrary);
+        notifyPrefixFixes(prefixFixes);
         const notes = [...warnings];
         if (newTypes.length) notes.push(`New ticket type(s): ${newTypes.join(", ")}`);
         if (updatedTypes.length) notes.push(...updatedTypes.map((t) => `Updated: ${t}`));
@@ -3917,6 +4011,71 @@ export default function App({ initialData } = {}) {
     setLibrary([...library, copy]);
     setSelectedUid(copy._uid);
     setTab("details");
+  };
+
+  /* Copy sub-types to the in-app clipboard; paste them into any ticket type
+     (or the same one). Unlike Duplicate, this works across ticket types. */
+  const copySubs = (subs, from) => {
+    if (!subs.length) { showToast({ type: "info", title: "Nothing to copy", lines: ["That ticket type has no sub-types yet."] }); return; }
+    setClip({ subs: subs.map((s) => JSON.parse(JSON.stringify(s))), from: from || "" });
+    showToast({ type: "success", title: `Copied ${subs.length} sub-type${subs.length === 1 ? "" : "s"}`, lines: ["Open another ticket type and press Paste (Sub-Types tab, or the paste icon in Ticket Types)."] });
+  };
+
+  const pasteSubs = (docUid) => {
+    const target = library.find((d) => d._uid === docUid);
+    if (!clip || !target) return;
+    const keys = new Set(target.ticketSubType.map((s) => xnorm(s.ticketKey).toLowerCase()));
+    const renamed = [];
+    const pasted = clip.subs.map((src) => {
+      const fresh = regenerateIds(src); // new ids for the sub-type, fields, statuses, options and escalation levels
+      fresh._passthrough = {}; // a pasted sub-type is a new record: no backend-only fields from the source
+      let key = fresh.ticketKey || "";
+      if (xnorm(key) && keys.has(xnorm(key).toLowerCase())) {
+        const base = `${key}_copy`;
+        let n = 2;
+        key = base;
+        while (keys.has(key.toLowerCase())) { key = `${base}${n}`; n += 1; }
+        fresh.ticketKey = key;
+        if (fresh.ticketType) fresh.ticketType = `${fresh.ticketType} (copy)`;
+        renamed.push(fresh.ticketType || key);
+      }
+      keys.add(xnorm(key).toLowerCase());
+      return fresh;
+    });
+    const { doc: fixedDoc, fixes } = normalizeDocPrefixes({ ...target, ticketSubType: [...target.ticketSubType, ...pasted] });
+    setLibrary(library.map((d) => (d._uid === docUid ? { ...fixedDoc, _uid: d._uid } : d)));
+    notifyPrefixFixes(fixes);
+    setSelectedUid(docUid);
+    setFocusSubtypeId(null);
+    setTab("subtypes");
+    showToast({
+      type: "success",
+      title: `Pasted ${pasted.length} sub-type${pasted.length === 1 ? "" : "s"} into "${target.ticketType || target.ticketKey || "(untitled)"}"`,
+      lines: renamed.length ? [`Key already existed there, so renamed: ${renamed.join(", ")}`] : [],
+    });
+  };
+
+  // Wipe everything (what Ctrl+R used to be for): ticket types, templates, clipboard and selections.
+  const clearAll = () => {
+    if (!library.length && !templates.length) {
+      showToast({ type: "info", title: "Nothing to clear", lines: ["The workspace is already empty."] });
+      return;
+    }
+    const tCount = library.length;
+    const subCount = library.reduce((n, d) => n + d.ticketSubType.length, 0);
+    const parts = [`${tCount} ticket type${tCount === 1 ? "" : "s"} (${subCount} sub-type${subCount === 1 ? "" : "s"})`];
+    if (templates.length) parts.push(`${templates.length} template${templates.length === 1 ? "" : "s"}`);
+    if (!window.confirm(`Clear ALL data — ${parts.join(" and ")}?\n\nThis wipes the whole workspace and can't be undone. Export first if you need a copy.`)) return;
+    setLibrary([]);
+    setTemplates([]);
+    setClip(null);
+    setSelectedUid(null);
+    setFocusSubtypeId(null);
+    setSubPick({ uid: null, ids: [] });
+    setImportNotice(null);
+    setBulkOpen(false);
+    setTab("library");
+    showToast({ type: "success", title: "Workspace cleared", lines: ["All ticket types and templates were removed."] });
   };
 
   const deleteType = (uidVal) => {
@@ -4165,6 +4324,7 @@ export default function App({ initialData } = {}) {
               <FileJson size={15} />Import JSON
             </Btn>
             <Btn variant="accent" onClick={() => selected && setTab("json")}><FileJson size={15} />Create JSON</Btn>
+            <Btn variant="danger" onClick={clearAll}><Eraser size={15} />Clear all</Btn>
           </div>
         </header>
 
@@ -4202,6 +4362,9 @@ export default function App({ initialData } = {}) {
               onDelete={deleteType}
               onBulkDelete={bulkDelete}
               onExportAll={exportAll}
+              clip={clip}
+              onCopySubs={copySubs}
+              onPasteSubs={pasteSubs}
             />
           )}
           {tab === "templates" && (
@@ -4231,6 +4394,17 @@ export default function App({ initialData } = {}) {
                 <Btn variant="ghost" onClick={() => setBulkOpen((v) => !v)}>
                   <Sparkles size={15} />Bulk create from template
                 </Btn>
+                <Btn variant="ghost" onClick={() => copySubs(selected.ticketSubType, selected.ticketType || selected.ticketKey)}>
+                  <ClipboardCopy size={15} />Copy all
+                </Btn>
+                {clip && (
+                  <>
+                    <Btn variant="accent" onClick={() => pasteSubs(selected._uid)}>
+                      <ClipboardPaste size={15} />Paste {clip.subs.length} copied sub-type{clip.subs.length === 1 ? "" : "s"}{clip.from ? ` (from ${clip.from})` : ""}
+                    </Btn>
+                    <IconBtn title="Clear the clipboard" onClick={() => setClip(null)}><X size={14} /></IconBtn>
+                  </>
+                )}
               </div>
 
               {bulkOpen && (
@@ -4258,11 +4432,12 @@ export default function App({ initialData } = {}) {
                       <span className="text-sm text-indigo-200">{pickedSubIds.size} selected</span>
                       <div className="ml-auto flex items-center gap-2">
                         <Btn variant="ghost" small onClick={() => setPickedSubIds([])}>Clear</Btn>
+                        <Btn variant="ghost" small onClick={() => copySubs(selected.ticketSubType.filter((x) => pickedSubIds.has(x.id)), selected.ticketType || selected.ticketKey)}><ClipboardCopy size={13} />Copy selected</Btn>
                         <Btn variant="danger" small onClick={deletePickedSubtypes}><Trash2 size={13} />Delete selected</Btn>
                       </div>
                     </>
                   ) : (
-                    <span className="text-xs text-white/70">Tick sub-types to delete several at once.</span>
+                    <span className="text-xs text-white/70">Tick sub-types to copy or delete several at once.</span>
                   )}
                 </div>
               )}
@@ -4276,6 +4451,7 @@ export default function App({ initialData } = {}) {
                     onChange: (on) => setPickedSubIds(on ? [...pickedSubIds, s.id] : [...pickedSubIds].filter((x) => x !== s.id)),
                   }}
                   forceOpen={s.id === focusSubtypeId}
+                  onCopy={() => copySubs([s], selected.ticketType || selected.ticketKey)}
                   onChange={(patch) => updateSelected({ ...selected, ticketSubType: selected.ticketSubType.map((x) => (x.id === s.id ? patch : x)) })}
                   onDelete={() => {
                     if (window.confirm(`Remove sub-type "${s.ticketType || s.ticketKey || "(unnamed)"}"? This can't be undone.`)) {
