@@ -3,7 +3,7 @@ import {
   Plus, Trash2, ChevronDown, ChevronRight, Copy, Download,
   FileJson, Users, Ticket, ListTree, Workflow, Check, X,
   GripVertical, AlertTriangle, RefreshCw, FileSpreadsheet,
-  Sparkles, LayoutTemplate, Star, Wand2, Diff, ClipboardCopy, ClipboardPaste, Eraser
+  Sparkles, LayoutTemplate, Star, Wand2, Diff, ClipboardCopy, ClipboardPaste, Eraser, ChevronUp
 } from "lucide-react";
 import * as XLSX from "xlsx-js-style";
 
@@ -811,7 +811,8 @@ function xParseEscalationDetailsLegacy(sheet) {
      Notification (Yes/No) | Notification Type | CC Email Addresses | Override Status
    Ticket Key / Ticket Subtype / Status "stick down" until a new value is given,
    so they only need to appear on the first row of a group. Columns are found by
-   header name; Level is informational (rows keep their order). Notification
+   header name. Level (1 = escalates first) sets the order of the levels, so to
+   shuffle the assignees just change the Level numbers. Notification
    defaults to Yes, in-app + email when those cells are empty. */
 function xNotifTypes(cell) {
   const wanted = xnorm(cell).split(/[,;/\n]+/).map((t) => t.toLowerCase().replace(/[^a-z]/g, "")).filter(Boolean);
@@ -827,6 +828,7 @@ function xParseEscalationRows(rows, headerIdx) {
   const find = (test) => header.findIndex(test);
   const cSub = find((h) => h.includes("subtype"));
   const cStatus = find((h) => h === "status" || h.startsWith("status"));
+  const cLevel = find((h) => h.startsWith("level"));
   const cDays = find((h) => h.includes("days"));
   const cRole = find((h) => h.includes("assignee") || h.includes("role"));
   const cNotif = find((h) => h.startsWith("notification") && !h.includes("type"));
@@ -854,7 +856,9 @@ function xParseEscalationRows(rows, headerIdx) {
     const types = cType >= 0 ? xNotifTypes(xCell(r, cType)) : [];
     const ccCell = cCc >= 0 ? xnorm(xCell(r, cCc)) : "";
     const overCell = cOver >= 0 ? xnorm(xCell(r, cOver)) : "";
+    const lvl = cLevel >= 0 ? parseFloat(xnorm(xCell(r, cLevel))) : NaN;
     const entry = {
+      _lv: Number.isFinite(lvl) ? lvl : Infinity, // blank / invalid Level -> after the numbered ones, in sheet order
       assignee: role,
       days,
       notification: notifCell ? !xNoish(notifCell) : true,
@@ -866,6 +870,10 @@ function xParseEscalationRows(rows, headerIdx) {
     const bySub = (bucket[status] = bucket[status] || {});
     (bySub[sub] = bySub[sub] || []).push(entry);
   }
+  // Level decides the order inside a (ticket, sub-type, status) group; rows may sit anywhere in the sheet.
+  Object.values(escalationByTicket).forEach((byStatus) => Object.values(byStatus).forEach((bySub) => Object.keys(bySub).forEach((sub) => {
+    bySub[sub] = bySub[sub].map((e, i) => ({ e, i })).sort((a, b) => (a.e._lv - b.e._lv) || (a.i - b.i)).map(({ e }) => { const { _lv, ...rest } = e; return rest; });
+  })));
   return { escalationByTicket, warnings };
 }
 
@@ -1521,12 +1529,14 @@ function excelWorkbookFromDocs(docs) {
   }
 
   // Escalation details: one row per escalation level, every field kept (days,
-  // assignee, notify on/off, channels, CC emails, override status). Ticket Key /
-  // Sub-type / Status are written once at the top of each group; ticket types are
-  // separated by a blank row and shaded alternately so the groups are easy to scan.
-  const ESC_HEADER = ["Ticket Key", "Ticket Subtype", "Status", "Level", "Days", "Assignee Role", "Notification (Yes/No)", "Notification Type", "CC Email Addresses", "Override Status"];
+  // assignee, notify on/off, channels, CC emails, override status). Every row
+  // carries its own Ticket Key / Sub-type / Status (repeats are greyed) so rows can
+  // be sorted, filtered, cut and pasted freely; the Level number sets the order.
+  // Ticket types are separated by a blank row and shaded alternately.
+  const ESC_HEADER = ["Ticket Key", "Ticket Subtype", "Status", "Level (1 = first)", "Days", "Assignee Role", "Notification (Yes/No)", "Notification Type", "CC Email Addresses", "Override Status"];
   const escRows = [ESC_HEADER];
   const escBand = [-1]; // per sheet row: which ticket type it belongs to (-1 = header / spacer)
+  const escRepeat = [[]]; // per sheet row: [key, sub-type, status] cells that repeat the row above
   list.forEach((doc, di) => {
     let firstOfTicket = true;
     doc.ticketSubType.forEach((s) => {
@@ -1535,9 +1545,9 @@ function excelWorkbookFromDocs(docs) {
         (st.autoEscalationConfig || []).forEach((e, i) => {
           const days = /^\d+$/.test(String(e.days).trim()) ? Number(e.days) : e.days;
           escRows.push([
-            firstOfTicket ? doc.ticketKey : "",
-            firstOfSub ? (s.ticketType || s.ticketKey) : "",
-            i === 0 ? (st.label || st.status) : "",
+            doc.ticketKey,
+            s.ticketType || s.ticketKey,
+            st.label || st.status,
             i + 1,
             days === undefined ? "" : days,
             e.assignee || "",
@@ -1547,19 +1557,20 @@ function excelWorkbookFromDocs(docs) {
             e.overrideStatus || "",
           ]);
           escBand.push(di);
+          escRepeat.push([!firstOfTicket, !firstOfSub, i > 0]);
           firstOfTicket = false;
           firstOfSub = false;
         });
       });
     });
-    if (!firstOfTicket) { escRows.push([]); escBand.push(-1); }
+    if (!firstOfTicket) { escRows.push([]); escBand.push(-1); escRepeat.push([]); }
   });
   if (escRows.length === 1) escRows.push(["No auto-escalation rules configured."]);
-  else if (!escRows[escRows.length - 1].length) { escRows.pop(); escBand.pop(); }
+  else if (!escRows[escRows.length - 1].length) { escRows.pop(); escBand.pop(); escRepeat.pop(); }
   {
     const ws_ = XLSX.utils.aoa_to_sheet(escRows);
     styleSheet(ws_, ESC_HEADER.length);
-    ws_["!cols"] = [26, 26, 16, 7, 8, 22, 14, 18, 40, 18].map((wch) => ({ wch }));
+    ws_["!cols"] = [26, 26, 16, 14, 8, 22, 14, 18, 40, 18].map((wch) => ({ wch }));
     escBand.forEach((band, r) => {
       if (band < 0 || r === 0) return;
       for (let c = 0; c < ESC_HEADER.length; c++) {
@@ -1567,7 +1578,7 @@ function excelWorkbookFromDocs(docs) {
         if (!ws_[ref]) ws_[ref] = { t: "s", v: "" };
         ws_[ref].s = {
           ...(band % 2 ? { fill: { fgColor: { rgb: "EEF2FA" } } } : {}),
-          ...(c === 0 || c === 1 ? { font: { bold: true } } : {}),
+          ...(c <= 2 ? { font: escRepeat[r][c] ? { color: { rgb: "9AA5B8" } } : { bold: true } } : {}),
           alignment: { vertical: "center", wrapText: c === 8, horizontal: c === 3 || c === 4 || c === 6 ? "center" : "left" },
         };
       }
@@ -2514,16 +2525,48 @@ function CustomFieldsList({ fields, onChange, restrictToDropdown }) {
 /* ------------------------------------------------------------------ */
 
 function AutoEscalationList({ rules, onChange }) {
+  const [dragIdx, setDragIdx] = useState(null);
+  const [overIdx, setOverIdx] = useState(null);
   const update = (id, patch) => onChange(rules.map((r) => (r.id === id ? { ...r, ...patch } : r)));
   const remove = (id) => onChange(rules.filter((r) => r.id !== id));
   const add = () => onChange([...rules, newAutoEscalation()]);
+  // Level order = array order (level 1 escalates first). Move one level up/down, or drag it to a new place.
+  const move = (from, to) => {
+    if (from == null || to < 0 || to >= rules.length || from === to) return;
+    const next = [...rules];
+    const [m] = next.splice(from, 1);
+    next.splice(to, 0, m);
+    onChange(next);
+  };
   return (
     <div>
-      {rules.map((r) => (
-        <div key={r.id} className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-3 mb-2.5">
+      {rules.length > 1 && <p className="text-xs text-white/70 mb-2">Levels escalate in order, Level 1 first. Use the arrows or drag the grip to reorder.</p>}
+      {rules.map((r, i) => (
+        <div
+          key={r.id}
+          onDragOver={(e) => { if (dragIdx != null) { e.preventDefault(); setOverIdx(i); } }}
+          onDrop={(e) => { e.preventDefault(); move(dragIdx, i); setDragIdx(null); setOverIdx(null); }}
+          className={`rounded-lg border bg-amber-500/5 p-3 mb-2.5 transition ${dragIdx === i ? "opacity-40" : ""} ${overIdx === i && dragIdx != null && dragIdx !== i ? "border-indigo-400 ring-2 ring-indigo-400/40" : "border-amber-500/20"}`}
+        >
           <div className="flex justify-between items-center mb-2">
-            <div className="flex items-center gap-1.5 text-amber-400 text-xs font-semibold"><AlertTriangle size={13} /> Escalation rule</div>
-            <IconBtn danger onClick={() => remove(r.id)}><Trash2 size={14} /></IconBtn>
+            <div className="flex items-center gap-1.5 text-amber-400 text-xs font-semibold">
+              <span
+                draggable
+                onDragStart={(e) => { e.dataTransfer.effectAllowed = "move"; setDragIdx(i); }}
+                onDragEnd={() => { setDragIdx(null); setOverIdx(null); }}
+                className="cursor-grab active:cursor-grabbing text-white/70 hover:text-white"
+                title="Drag to reorder"
+              >
+                <GripVertical size={14} />
+              </span>
+              <AlertTriangle size={13} /> Level {i + 1}
+              <span className="font-normal text-white/60">{i === 0 ? "— escalates first" : "— then"}</span>
+            </div>
+            <div className="flex items-center">
+              {i > 0 && <IconBtn title="Move up (escalate earlier)" onClick={() => move(i, i - 1)}><ChevronUp size={14} /></IconBtn>}
+              {i < rules.length - 1 && <IconBtn title="Move down (escalate later)" onClick={() => move(i, i + 1)}><ChevronDown size={14} /></IconBtn>}
+              <IconBtn danger onClick={() => remove(r.id)}><Trash2 size={14} /></IconBtn>
+            </div>
           </div>
           <div className="grid grid-cols-3 gap-2 mb-2">
             <div>
@@ -2558,7 +2601,7 @@ function AutoEscalationList({ rules, onChange }) {
         </div>
       ))}
       <button type="button" onClick={add} className="text-xs font-medium text-amber-400 hover:text-amber-300 inline-flex items-center gap-1">
-        <Plus size={13} /> Add escalation rule
+        <Plus size={13} /> Add escalation level
       </button>
     </div>
   );
