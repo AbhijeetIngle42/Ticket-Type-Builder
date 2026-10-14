@@ -1632,7 +1632,7 @@ function parseBulkEscalationPaste(text, library) {
 }
 
 /* Dry-run / apply in one: returns the new library plus a per-row report.
-   opts: { rows, levels, status, mode: "add"|"replace", sortByDays, inheritCc, extraCc[] }
+   opts: { rows, levels, status, mode: "add"|"replace", sortByDays, extraCc[] }   (new levels get CC emails only from extraCc)
    - add: an assignee already on the status only gets its days updated; others are appended
    - replace: the status's levels are replaced by the ones given
    - sortByDays: lowest days first (equal days keep their order)
@@ -1657,8 +1657,7 @@ function bulkEscalationPlan(library, opts) {
         const existing = w.autoEscalationConfig || [];
         let chain = opts.mode === "replace" ? [] : existing.map((e) => ({ ...e }));
         if (opts.mode === "replace") rep.removed += existing.length;
-        const inherited = opts.inheritCc ? ((existing.find((e) => (e.ccAddress || []).length) || {}).ccAddress || []) : [];
-        const cc = [...new Set([...inherited, ...(opts.extraCc || [])])];
+        const cc = [...new Set(opts.extraCc || [])];
         desired.forEach((dl) => {
           const at = chain.findIndex((e) => xnorm(e.assignee).toLowerCase() === dl.assignee.toLowerCase());
           if (at >= 0) {
@@ -3925,7 +3924,6 @@ function BulkEscalationTab({ library, onApply }) {
   const [status, setStatus] = useState("open");
   const [mode, setMode] = useState("add");
   const [sortByDays, setSortByDays] = useState(true);
-  const [inheritCc, setInheritCc] = useState(true);
   const [extraCcText, setExtraCcText] = useState("");
   const [levels, setLevels] = useState([{ days: "0" }, { days: "3" }]);
   const [rows, setRows] = useState([]);
@@ -3934,8 +3932,8 @@ function BulkEscalationTab({ library, onApply }) {
   const cellInput = "w-full rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-1.5 text-sm text-white placeholder:text-slate-600 outline-none focus:border-indigo-400";
   const extraCc = extraCcText.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean);
   const plan = useMemo(
-    () => bulkEscalationPlan(library, { rows, levels, status, mode, sortByDays, inheritCc, extraCc }),
-    [library, rows, levels, status, mode, sortByDays, inheritCc, extraCcText], // eslint-disable-line react-hooks/exhaustive-deps
+    () => bulkEscalationPlan(library, { rows, levels, status, mode, sortByDays, extraCc }),
+    [library, rows, levels, status, mode, sortByDays, extraCcText], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const changes = plan.totals.added + plan.totals.updated + plan.totals.removed;
 
@@ -4000,13 +3998,12 @@ function BulkEscalationTab({ library, onApply }) {
           </select>
         </div>
         <div className="md:col-span-2">
-          <Label hint="Added to the new levels (comma separated)">Extra CC emails (optional)</Label>
+          <Label hint="Only the new levels get these (comma separated). Leave empty for no CC.">CC emails (optional)</Label>
           <Input value={extraCcText} onChange={setExtraCcText} placeholder="ops@company.com" />
         </div>
       </div>
       <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm text-white">
         <label className="flex cursor-pointer items-center gap-2"><Checkbox checked={sortByDays} onChange={setSortByDays} />Order levels by days (lowest first; equal days keep their order)</label>
-        <label className="flex cursor-pointer items-center gap-2"><Checkbox checked={inheritCc} onChange={setInheritCc} />Copy the CC emails already on that status</label>
       </div>
 
       <div className="overflow-x-auto rounded-xl border border-white/10 bg-[#111528]">
