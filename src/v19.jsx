@@ -1597,6 +1597,88 @@ function excelWorkbookFromDocs(docs) {
 /* found becomes the template's fields + status workflow.              */
 /* ------------------------------------------------------------------ */
 
+/* ---- Bulk escalation: add the same escalation levels to one status of every
+   sub-type of the chosen ticket types, in one go. ---- */
+
+// "ACCOUNTS  ISSUE" and "Accounts Issues" are the same ticket type: compare case-, space- and plural-insensitively.
+const xnKey = (v) => xnorm(v).toLowerCase().replace(/[^a-z0-9]/g, "").replace(/s$/, "");
+function matchTicketType(library, text) {
+  if (/^(all|\*|all ticket types)$/i.test(xnorm(text))) return "*";
+  const k = xnKey(text);
+  if (!k) return "";
+  const hit = library.find((d) => xnKey(d.ticketType) === k || xnKey(d.ticketKey) === k);
+  return hit ? hit._uid : "";
+}
+
+/* Pasted spreadsheet table -> { levels:[{days}], rows:[{id,target,label,roles[]}] }.
+   Row = ticket type + one assignee cell per level. A header such as
+   "Assignee 2 after 72 hours" / "after 3 days" sets that level's days. */
+function parseBulkEscalationPaste(text, library) {
+  const lines = String(text || "").split(/\r?\n/).map((l) => l.split("\t").map((c) => c.trim())).filter((c) => c.some(Boolean));
+  if (!lines.length) return { levels: [], rows: [] };
+  let header = null;
+  if (!matchTicketType(library, lines[0][0]) && /ticket|type|assignee|level|role/i.test(lines[0].join(" "))) header = lines.shift();
+  const width = Math.max(1, ...lines.map((l) => l.length - 1));
+  const levels = [];
+  for (let i = 0; i < width; i++) {
+    const h = (header && header[i + 1]) || "";
+    const hr = h.match(/(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)\b/i);
+    const dy = h.match(/(\d+(?:\.\d+)?)\s*days?/i);
+    const days = hr ? Math.round((parseFloat(hr[1]) / 24) * 100) / 100 : dy ? parseFloat(dy[1]) : null;
+    levels.push({ days: String(days != null ? days : i === 0 ? 0 : (parseFloat(levels[i - 1].days) || 0) + 1) });
+  }
+  const rows = lines.map((l) => ({ id: uid(), target: matchTicketType(library, l[0]), label: l[0] || "", roles: levels.map((_, i) => l[i + 1] || "") }));
+  return { levels, rows };
+}
+
+/* Dry-run / apply in one: returns the new library plus a per-row report.
+   opts: { rows, levels, status, mode: "add"|"replace", sortByDays, inheritCc, extraCc[] }
+   - add: an assignee already on the status only gets its days updated; others are appended
+   - replace: the status's levels are replaced by the ones given
+   - sortByDays: lowest days first (equal days keep their order)
+   Roles used by the levels are added to the sub-type and ticket type assignee roles. */
+function bulkEscalationPlan(library, opts) {
+  const code = xToStatusCode(opts.status);
+  const daysOf = (e) => { const n = parseFloat(e.days); return Number.isFinite(n) ? n : Infinity; };
+  let lib = library;
+  const rows = opts.rows.map((row) => {
+    const rep = { id: row.id, subs: 0, added: 0, updated: 0, removed: 0, missing: [], skipped: "" };
+    const desired = [];
+    opts.levels.forEach((lv, i) => xSplitRoles(row.roles[i]).forEach((r) => desired.push({ assignee: r, days: String(lv.days).trim() })));
+    if (!row.target) { rep.skipped = "pick a ticket type"; return rep; }
+    if (!desired.length) { rep.skipped = "no assignees"; return rep; }
+    lib = lib.map((d) => {
+      if (row.target !== "*" && d._uid !== row.target) return d;
+      const subs = d.ticketSubType.map((sub) => {
+        const idx = sub.statusWorkFlow.findIndex((w) => xToStatusCode(w.status) === code || xToStatusCode(w.label) === code);
+        if (idx < 0) { rep.missing.push(`${d.ticketType || d.ticketKey} › ${sub.ticketType || sub.ticketKey}`); return sub; }
+        rep.subs++;
+        const w = sub.statusWorkFlow[idx];
+        const existing = w.autoEscalationConfig || [];
+        let chain = opts.mode === "replace" ? [] : existing.map((e) => ({ ...e }));
+        if (opts.mode === "replace") rep.removed += existing.length;
+        const inherited = opts.inheritCc ? ((existing.find((e) => (e.ccAddress || []).length) || {}).ccAddress || []) : [];
+        const cc = [...new Set([...inherited, ...(opts.extraCc || [])])];
+        desired.forEach((dl) => {
+          const at = chain.findIndex((e) => xnorm(e.assignee).toLowerCase() === dl.assignee.toLowerCase());
+          if (at >= 0) {
+            if (String(chain[at].days) !== dl.days) { chain[at] = { ...chain[at], days: dl.days }; rep.updated++; }
+          } else {
+            chain.push({ id: uid(), _id: uuidv4(), assignee: dl.assignee, days: dl.days, overrideStatus: "", notification: true, notificationType: [...NOTIF_TYPES], ccAddress: [...cc] });
+            rep.added++;
+          }
+        });
+        if (opts.sortByDays) chain = chain.map((e, i) => ({ e, i })).sort((a, b) => (daysOf(a.e) - daysOf(b.e)) || (a.i - b.i)).map((x) => x.e);
+        return { ...sub, isAutoEscalation: true, statusWorkFlow: sub.statusWorkFlow.map((x, i) => (i === idx ? { ...x, autoEscalationConfig: chain } : x)) };
+      });
+      return syncAssigneeRoles({ ...d, ticketSubType: subs });
+    });
+    return rep;
+  });
+  const totals = rows.reduce((t, r) => ({ subs: t.subs + r.subs, added: t.added + r.added, updated: t.updated + r.updated, removed: t.removed + r.removed }), { subs: 0, added: 0, updated: 0, removed: 0 });
+  return { library: lib, rows, totals };
+}
+
 function templateFromRawJson(raw, name) {
   let candidate = raw;
   if (candidate && Array.isArray(candidate.result)) candidate = candidate.result[0];
@@ -3836,6 +3918,180 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
 }
 
 /* ------------------------------------------------------------------ */
+/* Bulk escalation                                                     */
+/* ------------------------------------------------------------------ */
+
+function BulkEscalationTab({ library, onApply }) {
+  const [status, setStatus] = useState("open");
+  const [mode, setMode] = useState("add");
+  const [sortByDays, setSortByDays] = useState(true);
+  const [inheritCc, setInheritCc] = useState(true);
+  const [extraCcText, setExtraCcText] = useState("");
+  const [levels, setLevels] = useState([{ days: "0" }, { days: "3" }]);
+  const [rows, setRows] = useState([]);
+  const [pasted, setPasted] = useState(false);
+
+  const cellInput = "w-full rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-1.5 text-sm text-white placeholder:text-slate-600 outline-none focus:border-indigo-400";
+  const extraCc = extraCcText.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean);
+  const plan = useMemo(
+    () => bulkEscalationPlan(library, { rows, levels, status, mode, sortByDays, inheritCc, extraCc }),
+    [library, rows, levels, status, mode, sortByDays, inheritCc, extraCcText], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const changes = plan.totals.added + plan.totals.updated + plan.totals.removed;
+
+  const setRow = (id, patch) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const setRole = (id, i, v) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, roles: r.roles.map((x, j) => (j === i ? v : x)) } : r)));
+  const addRow = () => setRows((rs) => [...rs, { id: uid(), target: "", label: "", roles: levels.map(() => "") }]);
+  const addLevel = () => {
+    setLevels((ls) => [...ls, { days: String((parseFloat(ls[ls.length - 1]?.days) || 0) + 1) }]);
+    setRows((rs) => rs.map((r) => ({ ...r, roles: [...r.roles, ""] })));
+  };
+  const removeLevel = (i) => {
+    if (levels.length < 2) return;
+    setLevels((ls) => ls.filter((_, j) => j !== i));
+    setRows((rs) => rs.map((r) => ({ ...r, roles: r.roles.filter((_, j) => j !== i) })));
+  };
+  const onPaste = (e) => {
+    const text = e.clipboardData.getData("text");
+    if (!text.trim()) return;
+    e.preventDefault();
+    const parsed = parseBulkEscalationPaste(text, library);
+    if (!parsed.rows.length) return;
+    setLevels(parsed.levels);
+    setRows(parsed.rows);
+    setPasted(true);
+  };
+  const apply = () => {
+    if (!changes) return;
+    const where = plan.totals.subs;
+    const parts = [plan.totals.added ? `add ${plan.totals.added} level${plan.totals.added === 1 ? "" : "s"}` : "", plan.totals.updated ? `update days on ${plan.totals.updated}` : "", plan.totals.removed ? `remove ${plan.totals.removed} existing level${plan.totals.removed === 1 ? "" : "s"}` : ""].filter(Boolean);
+    if (!window.confirm(`On the "${status}" status of ${where} sub-type${where === 1 ? "" : "s"}: ${parts.join(", ")}.\n\nContinue?`)) return;
+    onApply(plan.library, plan.totals);
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="rounded-xl border border-white/10 bg-[#0D1220] p-4 text-sm text-white">
+        <p className="font-medium mb-1">Add the same escalation levels to every sub-type, in one step</p>
+        <p className="text-xs text-white/70">
+          Each row is a ticket type; each level column is the assignee role for that level and the days after which it escalates.
+          Paste a table straight from Excel (ticket type in the first column, one assignee column per level), or fill the grid by hand.
+          Use <span className="font-mono">All ticket types</span> in a row to apply the same roles everywhere.
+        </p>
+        <textarea
+          onPaste={onPaste}
+          rows={2}
+          placeholder="Click here and paste the table from Excel (Ctrl+V) — header cells like “Assignee 2 after 72 hours” set that level's days automatically"
+          className="mt-3 w-full rounded-lg border border-dashed border-white/20 bg-[#0B0F1C] px-3 py-2 text-xs text-white placeholder:text-slate-500 outline-none focus:border-indigo-400"
+        />
+        {pasted && <p className="mt-1 text-xs text-emerald-300">Table loaded — check the matches below, then apply.</p>}
+      </div>
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+        <div>
+          <Label hint="Status code or label">Status to update</Label>
+          <Input mono value={status} onChange={setStatus} placeholder="open" />
+        </div>
+        <div>
+          <Label>If a level already exists</Label>
+          <select value={mode} onChange={(e) => setMode(e.target.value)} className={cellInput}>
+            <option value="add">Keep existing, add the new ones</option>
+            <option value="replace">Replace all levels on that status</option>
+          </select>
+        </div>
+        <div className="md:col-span-2">
+          <Label hint="Added to the new levels (comma separated)">Extra CC emails (optional)</Label>
+          <Input value={extraCcText} onChange={setExtraCcText} placeholder="ops@company.com" />
+        </div>
+      </div>
+      <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm text-white">
+        <label className="flex cursor-pointer items-center gap-2"><Checkbox checked={sortByDays} onChange={setSortByDays} />Order levels by days (lowest first; equal days keep their order)</label>
+        <label className="flex cursor-pointer items-center gap-2"><Checkbox checked={inheritCc} onChange={setInheritCc} />Copy the CC emails already on that status</label>
+      </div>
+
+      <div className="overflow-x-auto rounded-xl border border-white/10 bg-[#111528]">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-[11px] uppercase tracking-wider text-white">
+              <th className="px-3 py-2.5 min-w-[210px]">Ticket type</th>
+              {levels.map((lv, i) => (
+                <th key={i} className="px-3 py-2.5 min-w-[190px]">
+                  <div className="flex items-center gap-2">
+                    <span>Level {i + 1}</span>
+                    <span className="font-normal normal-case text-white/70">days</span>
+                    <input
+                      value={lv.days}
+                      onChange={(e) => setLevels((ls) => ls.map((x, j) => (j === i ? { days: e.target.value.replace(/[^0-9.]/g, "") } : x)))}
+                      className="w-14 rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-1 text-sm text-white outline-none focus:border-indigo-400"
+                    />
+                    {levels.length > 1 && <IconBtn danger title="Remove this level column" onClick={() => removeLevel(i)}><X size={13} /></IconBtn>}
+                  </div>
+                </th>
+              ))}
+              <th className="px-3 py-2.5"><button type="button" onClick={addLevel} className="text-xs font-medium normal-case text-indigo-300 hover:text-indigo-200 inline-flex items-center gap-1"><Plus size={13} />Level</button></th>
+              <th className="px-3 py-2.5 min-w-[200px]">Result</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 && (
+              <tr><td colSpan={levels.length + 4} className="px-3 py-8 text-center text-xs text-white/70">Paste a table above, or add a row.</td></tr>
+            )}
+            {rows.map((r, ri) => {
+              const rep = plan.rows[ri] || {};
+              return (
+                <tr key={r.id} className="border-t border-white/5 align-top">
+                  <td className="px-3 py-2">
+                    <select
+                      value={r.target}
+                      onChange={(e) => setRow(r.id, { target: e.target.value })}
+                      className={`${cellInput} ${r.target ? "" : "ring-1 ring-rose-500/60"}`}
+                    >
+                      <option value="">{r.label ? `“${r.label}” — pick a ticket type` : "Pick a ticket type…"}</option>
+                      <option value="*">All ticket types</option>
+                      {library.map((d) => <option key={d._uid} value={d._uid}>{d.ticketType || d.ticketKey}</option>)}
+                    </select>
+                  </td>
+                  {levels.map((_, i) => (
+                    <td key={i} className="px-3 py-2"><input value={r.roles[i] || ""} onChange={(e) => setRole(r.id, i, e.target.value)} placeholder="role (comma for several)" className={`${cellInput} font-mono`} /></td>
+                  ))}
+                  <td />
+                  <td className="px-3 py-2 text-xs leading-5">
+                    {rep.skipped ? (
+                      <span className="text-amber-300">Skipped — {rep.skipped}</span>
+                    ) : (
+                      <>
+                        <span className="text-white">{rep.subs} sub-type{rep.subs === 1 ? "" : "s"}</span>
+                        <span className="text-emerald-300"> · +{rep.added}</span>
+                        {rep.updated > 0 && <span className="text-sky-300"> · {rep.updated} days updated</span>}
+                        {rep.removed > 0 && <span className="text-rose-300"> · −{rep.removed} replaced</span>}
+                        {rep.missing.length > 0 && <div className="text-amber-300" title={rep.missing.join("\n")}>{rep.missing.length} sub-type{rep.missing.length === 1 ? "" : "s"} have no “{status}” status</div>}
+                      </>
+                    )}
+                  </td>
+                  <td className="px-2 py-2"><IconBtn danger title="Remove row" onClick={() => setRows((rs) => rs.filter((x) => x.id !== r.id))}><Trash2 size={14} /></IconBtn></td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <Btn variant="dashed" onClick={addRow}><Plus size={15} />Add row</Btn>
+        <div className="ml-auto flex items-center gap-3">
+          <span className="text-sm text-white">
+            {changes ? `${plan.totals.added} to add · ${plan.totals.updated} to update · ${plan.totals.removed} to remove, across ${plan.totals.subs} sub-types` : "Nothing to change yet"}
+          </span>
+          <Btn variant="accent" onClick={apply}><Check size={15} />Apply to all sub-types</Btn>
+        </div>
+      </div>
+      <p className="text-xs text-white/70">The roles you enter are also added to each sub-type's and ticket type's assignee roles, which the export check requires. Sub-types stay switched on for auto-escalation.</p>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* App                                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -4383,10 +4639,20 @@ export default function App({ initialData } = {}) {
     setBulkOpen(false);
   };
 
+  const applyBulkEscalation = (nextLibrary, totals) => {
+    setLibrary(nextLibrary);
+    showToast({
+      type: "success",
+      title: "Escalation levels applied",
+      lines: [`${totals.added} added, ${totals.updated} days updated${totals.removed ? `, ${totals.removed} replaced` : ""} across ${totals.subs} sub-types. Assignee roles were added where needed.`],
+    });
+  };
+
   const nav = [
     { id: "library", label: `Ticket Types (${library.length})`, icon: <ListTree size={16} /> },
     { id: "templates", label: `Templates (${templates.length})`, icon: <LayoutTemplate size={16} /> },
     { id: "smartupdate", label: "Smart Update", icon: <Wand2 size={16} /> },
+    { id: "bulkesc", label: "Bulk Escalation", icon: <AlertTriangle size={16} /> },
     { id: "details", label: "Details", icon: <Ticket size={16} /> },
     { id: "roles", label: "Roles", icon: <Users size={16} /> },
     { id: "subtypes", label: `Sub-Types (${selected ? selected.ticketSubType.length : 0})`, icon: <ListTree size={16} /> },
@@ -4416,7 +4682,7 @@ export default function App({ initialData } = {}) {
         </div>
         <nav className="flex-1 px-2 py-4 space-y-1">
           {nav.map((n) => {
-            const disabled = n.id !== "library" && n.id !== "templates" && n.id !== "smartupdate" && !selected;
+            const disabled = n.id !== "library" && n.id !== "templates" && n.id !== "smartupdate" && n.id !== "bulkesc" && !selected;
             return (
               <button
                 key={n.id}
@@ -4442,10 +4708,10 @@ export default function App({ initialData } = {}) {
         <header className="bg-[#0A0E1C] border-b border-white/10 px-8 py-4 flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-base font-semibold text-white truncate">
-              {tab === "library" ? "All ticket types" : tab === "templates" ? "Sub-type templates" : tab === "smartupdate" ? "Smart update" : (selected ? (selected.ticketType || "Untitled ticket type") : "No ticket type selected")}
+              {tab === "library" ? "All ticket types" : tab === "templates" ? "Sub-type templates" : tab === "smartupdate" ? "Smart update" : tab === "bulkesc" ? "Bulk escalation" : (selected ? (selected.ticketType || "Untitled ticket type") : "No ticket type selected")}
             </h1>
             <p className="text-xs font-mono text-white">
-              {tab === "library" ? `${library.length} loaded` : tab === "templates" ? `${templates.length} template${templates.length === 1 ? "" : "s"} available for bulk creation` : tab === "smartupdate" ? "describe changes, review the diff, then apply" : (selected ? (selected.ticketKey || "no key set yet") : "pick one from Ticket Types")}
+              {tab === "library" ? `${library.length} loaded` : tab === "templates" ? `${templates.length} template${templates.length === 1 ? "" : "s"} available for bulk creation` : tab === "smartupdate" ? "describe changes, review the diff, then apply" : tab === "bulkesc" ? "bulk-add escalation levels" : (selected ? (selected.ticketKey || "no key set yet") : "pick one from Ticket Types")}
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -4490,7 +4756,7 @@ export default function App({ initialData } = {}) {
           </div>
         )}
 
-        <div className={(tab === "library" || tab === "templates" || tab === "smartupdate") ? "px-8 py-6" : "px-8 py-6 max-w-4xl"}>
+        <div className={(tab === "library" || tab === "templates" || tab === "smartupdate" || tab === "bulkesc") ? "px-8 py-6" : "px-8 py-6 max-w-4xl"}>
           {tab === "library" && (
             <LibraryTab
               library={library}
@@ -4523,6 +4789,7 @@ export default function App({ initialData } = {}) {
           {tab === "smartupdate" && (
             <SmartUpdateTab library={library} onApply={applySmartUpdate} onExportExcel={exportAllToExcel} />
           )}
+          {tab === "bulkesc" && <BulkEscalationTab library={library} onApply={applyBulkEscalation} />}
           {tab === "details" && selected && <DetailsTab doc={selected} onChange={updateSelected} />}
           {tab === "roles" && selected && <RolesTab doc={selected} onChange={updateSelected} />}
           {tab === "subtypes" && selected && (
