@@ -756,7 +756,7 @@ function xParseMandateRules(sheet) {
    everything under "__default__" (single-ticket sheet, unchanged
    behavior). Returns { escalationByTicket, warnings } where
    escalationByTicket is ticketKey -> escalationByStatus. */
-function xParseEscalationDetails(sheet) {
+function xParseEscalationDetailsLegacy(sheet) {
   const rows = xRowsOf(sheet);
   const escalationByTicket = {};
   const warnings = [];
@@ -806,6 +806,76 @@ function xParseEscalationDetails(sheet) {
   return { escalationByTicket, warnings };
 }
 
+/* Escalation details, one row per escalation level (current layout):
+     Ticket Key | Ticket Subtype | Status | Level | Days | Assignee Role |
+     Notification (Yes/No) | Notification Type | CC Email Addresses | Override Status
+   Ticket Key / Ticket Subtype / Status "stick down" until a new value is given,
+   so they only need to appear on the first row of a group. Columns are found by
+   header name; Level is informational (rows keep their order). Notification
+   defaults to Yes, in-app + email when those cells are empty. */
+function xNotifTypes(cell) {
+  const wanted = xnorm(cell).split(/[,;/\n]+/).map((t) => t.toLowerCase().replace(/[^a-z]/g, "")).filter(Boolean);
+  const out = [];
+  wanted.forEach((w) => {
+    const hit = NOTIF_TYPES.find((n) => n.toLowerCase() === w) || (w === "app" || w === "inapp" ? "inApp" : null);
+    if (hit && !out.includes(hit)) out.push(hit);
+  });
+  return out;
+}
+function xParseEscalationRows(rows, headerIdx) {
+  const header = rows[headerIdx].map((h) => xnorm(h).toLowerCase());
+  const find = (test) => header.findIndex(test);
+  const cSub = find((h) => h.includes("subtype"));
+  const cStatus = find((h) => h === "status" || h.startsWith("status"));
+  const cDays = find((h) => h.includes("days"));
+  const cRole = find((h) => h.includes("assignee") || h.includes("role"));
+  const cNotif = find((h) => h.startsWith("notification") && !h.includes("type"));
+  const cType = find((h) => h.includes("notification") && h.includes("type"));
+  const cCc = find((h) => h.includes("cc"));
+  const cOver = find((h) => h.includes("override"));
+  const escalationByTicket = {};
+  const warnings = [];
+  let key = "__default__";
+  let sub = "";
+  let status = "";
+  for (const r of rows.slice(headerIdx + 1)) {
+    const k = xnorm(xCell(r, 0));
+    if (k) { key = k; sub = ""; status = ""; }
+    const sv = cSub >= 0 ? xnorm(xCell(r, cSub)) : "";
+    if (sv) { sub = sv; status = ""; }
+    const stv = cStatus >= 0 ? xnorm(xCell(r, cStatus)) : "";
+    if (stv) status = xToStatusCode(stv);
+    const days = cDays >= 0 ? xnorm(xCell(r, cDays)) : "";
+    const role = cRole >= 0 ? xnorm(xCell(r, cRole)) : "";
+    if (!days && !role) continue;
+    if (!sub || !status) { warnings.push(`Escalation row (${role || days}) has no Ticket Subtype or Status above it — skipped.`); continue; }
+    if (!role) { warnings.push(`Escalation for '${sub}' under ${status} has Days but no Assignee Role — skipped that level.`); continue; }
+    const notifCell = cNotif >= 0 ? xnorm(xCell(r, cNotif)) : "";
+    const types = cType >= 0 ? xNotifTypes(xCell(r, cType)) : [];
+    const ccCell = cCc >= 0 ? xnorm(xCell(r, cCc)) : "";
+    const overCell = cOver >= 0 ? xnorm(xCell(r, cOver)) : "";
+    const entry = {
+      assignee: role,
+      days,
+      notification: notifCell ? !xNoish(notifCell) : true,
+      notificationType: types.length ? types : (cType >= 0 && xnorm(xCell(r, cType)) ? [] : [...NOTIF_TYPES]),
+      ccAddress: ccCell.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean),
+      overrideStatus: overCell ? xToStatusCode(overCell) : "",
+    };
+    const bucket = (escalationByTicket[key] = escalationByTicket[key] || {});
+    const bySub = (bucket[status] = bucket[status] || {});
+    (bySub[sub] = bySub[sub] || []).push(entry);
+  }
+  return { escalationByTicket, warnings };
+}
+
+function xParseEscalationDetails(sheet) {
+  const rows = xRowsOf(sheet);
+  const headerIdx = rows.findIndex((r) => xnorm(xCell(r, 0)).toLowerCase() === "ticket key");
+  // the older block layout (TICKET:/STATUS: markers, Days/Role pairs) is still read
+  return headerIdx >= 0 ? xParseEscalationRows(rows, headerIdx) : xParseEscalationDetailsLegacy(sheet);
+}
+
 function xBuildStatusWorkflow(subtypeName, globalStatusRoles, mandateRules, escalationByStatus) {
   const preferredOrder = ["open", "inprogress", "resolved", "closed"];
   const allCodes = new Set([...Object.keys(globalStatusRoles), ...Object.keys(mandateRules), ...Object.keys(escalationByStatus)]);
@@ -836,8 +906,10 @@ function xBuildStatusWorkflow(subtypeName, globalStatusRoles, mandateRules, esca
     const autoEscalation = escRows.map((e) => ({
       assignee: e.assignee,
       days: /^\d+$/.test(xnorm(e.days)) ? Number(e.days) : e.days,
-      notification: true,
-      notificationType: ["inApp", "email"],
+      notification: e.notification !== undefined ? e.notification : true,
+      notificationType: e.notificationType || ["inApp", "email"],
+      ...(e.ccAddress ? { ccAddress: e.ccAddress } : {}),
+      ...(e.overrideStatus ? { overrideStatus: e.overrideStatus } : {}),
     }));
 
     return {
@@ -1448,33 +1520,58 @@ function excelWorkbookFromDocs(docs) {
     XLSX.utils.book_append_sheet(wb, ws_, "Mandate rules for status change");
   }
 
-  const escRows = [];
-  list.forEach((doc) => {
-    const byStatus = new Map();
-    doc.ticketSubType.forEach((s) => s.statusWorkFlow.forEach((st) => {
-      if (!st.autoEscalationConfig || !st.autoEscalationConfig.length) return;
-      const code = xToStatusCode(st.status);
-      const l = byStatus.get(code) || { label: st.label || st.status, rows: [] };
-      l.rows.push({ subtype: s.ticketType || s.ticketKey, chain: st.autoEscalationConfig });
-      byStatus.set(code, l);
-    }));
-    if (!byStatus.size) return;
-    escRows.push([`TICKET: ${doc.ticketKey}`]);
-    byStatus.forEach((v) => {
-      escRows.push([`STATUS: ${v.label}`]);
-      escRows.push(["Ticket Subtype", "Issue Type", "Days", "Role", "Days", "Role"]);
-      v.rows.forEach((r) => {
-        const flat = [];
-        r.chain.forEach((step) => flat.push(step.days, step.assignee));
-        escRows.push([r.subtype, r.subtype, ...flat]);
+  // Escalation details: one row per escalation level, every field kept (days,
+  // assignee, notify on/off, channels, CC emails, override status). Ticket Key /
+  // Sub-type / Status are written once at the top of each group; ticket types are
+  // separated by a blank row and shaded alternately so the groups are easy to scan.
+  const ESC_HEADER = ["Ticket Key", "Ticket Subtype", "Status", "Level", "Days", "Assignee Role", "Notification (Yes/No)", "Notification Type", "CC Email Addresses", "Override Status"];
+  const escRows = [ESC_HEADER];
+  const escBand = [-1]; // per sheet row: which ticket type it belongs to (-1 = header / spacer)
+  list.forEach((doc, di) => {
+    let firstOfTicket = true;
+    doc.ticketSubType.forEach((s) => {
+      let firstOfSub = true;
+      s.statusWorkFlow.forEach((st) => {
+        (st.autoEscalationConfig || []).forEach((e, i) => {
+          const days = /^\d+$/.test(String(e.days).trim()) ? Number(e.days) : e.days;
+          escRows.push([
+            firstOfTicket ? doc.ticketKey : "",
+            firstOfSub ? (s.ticketType || s.ticketKey) : "",
+            i === 0 ? (st.label || st.status) : "",
+            i + 1,
+            days === undefined ? "" : days,
+            e.assignee || "",
+            e.notification === false ? "No" : "Yes",
+            (e.notificationType || []).join(", "),
+            (e.ccAddress || []).join(", "),
+            e.overrideStatus || "",
+          ]);
+          escBand.push(di);
+          firstOfTicket = false;
+          firstOfSub = false;
+        });
       });
-      escRows.push([]);
     });
+    if (!firstOfTicket) { escRows.push([]); escBand.push(-1); }
   });
-  if (!escRows.length) escRows.push(["No auto-escalation rules configured."]);
+  if (escRows.length === 1) escRows.push(["No auto-escalation rules configured."]);
+  else if (!escRows[escRows.length - 1].length) { escRows.pop(); escBand.pop(); }
   {
     const ws_ = XLSX.utils.aoa_to_sheet(escRows);
-    styleSheet(ws_, (escRows[0] || []).length);
+    styleSheet(ws_, ESC_HEADER.length);
+    ws_["!cols"] = [26, 26, 16, 7, 8, 22, 14, 18, 40, 18].map((wch) => ({ wch }));
+    escBand.forEach((band, r) => {
+      if (band < 0 || r === 0) return;
+      for (let c = 0; c < ESC_HEADER.length; c++) {
+        const ref = XLSX.utils.encode_cell({ r, c });
+        if (!ws_[ref]) ws_[ref] = { t: "s", v: "" };
+        ws_[ref].s = {
+          ...(band % 2 ? { fill: { fgColor: { rgb: "EEF2FA" } } } : {}),
+          ...(c === 0 || c === 1 ? { font: { bold: true } } : {}),
+          alignment: { vertical: "center", wrapText: c === 8, horizontal: c === 3 || c === 4 || c === 6 ? "center" : "left" },
+        };
+      }
+    });
     XLSX.utils.book_append_sheet(wb, ws_, "Escalation details");
   }
 
