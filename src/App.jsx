@@ -76,6 +76,54 @@ function uuidv4() {
   });
 }
 
+/* MongoDB ObjectId (24 hex chars) in Extended JSON form: { "$oid": "..." }.
+   Top-level / sub-type `_id` must be exported as this object, not a plain
+   string. (Auto-escalation level `_id`s are a separate thing: still uuids.) */
+const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
+function newObjectId() {
+  const hex = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+  // 4-byte timestamp + 5-byte random + 3-byte counter, like a real ObjectId
+  const ts = Math.floor(Date.now() / 1000).toString(16).padStart(8, "0");
+  return ts + hex(10) + hex(6);
+}
+const newOid = () => ({ $oid: newObjectId() });
+/* "abc…" | {$oid:"abc…"} | undefined  ->  {$oid:"abc…"} (or left as-is if it
+   isn't a valid ObjectId string, so we never corrupt unknown id formats). */
+function toOid(v) {
+  if (v && typeof v === "object" && typeof v.$oid === "string") return v;
+  if (typeof v === "string" && OBJECT_ID_RE.test(v.trim())) return { $oid: v.trim() };
+  return v;
+}
+
+/* Status codes are always lowercase with no spaces/symbols
+   ("Resolved and Closed" -> "resolvedandclosed"). */
+const toStatusCode = (v) => String(v == null ? "" : v).toLowerCase().replace(/[^a-z0-9]/g, "");
+/* A status-level fileUpload field always uses this fixed key. */
+const STATUS_FILE_UPLOAD_KEY = "uploadImage";
+
+/* Applies the status rules: clean status/override/dependent codes, fixed
+   key for fileUpload fields, and mandatoryCustomFields kept in sync with
+   any key that had to change. */
+function normalizeStatus(s) {
+  const keyMap = {};
+  const fields = (s.customFieldsMetaData || []).map((f) => {
+    if (f && f.type === "fileUpload" && f.key !== STATUS_FILE_UPLOAD_KEY) {
+      if (f.key) keyMap[f.key] = STATUS_FILE_UPLOAD_KEY;
+      return { ...f, key: STATUS_FILE_UPLOAD_KEY };
+    }
+    return f;
+  });
+  return {
+    ...s,
+    status: toStatusCode(s.status),
+    overrideStatus: toStatusCode(s.overrideStatus),
+    dependentStatus: (s.dependentStatus || []).map(toStatusCode).filter(Boolean),
+    mandatoryCustomFields: [...new Set((s.mandatoryCustomFields || []).map((k) => keyMap[k] || k))],
+    customFieldsMetaData: fields,
+    autoEscalationConfig: (s.autoEscalationConfig || []).map((e) => ({ ...e, overrideStatus: toStatusCode(e.overrideStatus) })),
+  };
+}
+
 const newAutoEscalation = () => ({
   id: uid(), _id: uuidv4(), assignee: "", days: "", overrideStatus: "",
   notification: true, notificationType: ["inApp", "email"], ccAddress: [],
@@ -97,7 +145,7 @@ const newSubType = () => ({
 const emptyDoc = () => ({
   ticketKey: "", ticketType: "", tenantId: "", deleted: false,
   creators: [], viewers: [], assignee: [],
-  ticketSubType: [], _passthrough: {},
+  ticketSubType: [], _passthrough: { _id: newOid() },
 });
 
 /* Keys the editor models explicitly at the doc / sub-type level. Anything
@@ -229,7 +277,8 @@ function fieldToJson(f, subTypeLevel = false) {
   return { label: f.label, key: f.key, type: f.type, ...adv };
 }
 
-function statusToJson(s) {
+function statusToJson(s0) {
+  const s = normalizeStatus(s0);
   return {
     status: s.status, label: s.label, public: s.public,
     roles: s.roles, assignee: (s.assigneeRoles || []).map((r) => ({ roleId: r })),
@@ -253,8 +302,10 @@ function statusToJson(s) {
 const subTypeHasEscalation = (st) => (st.statusWorkFlow || []).some((w) => (w.autoEscalationConfig || []).length > 0);
 
 function subTypeToJson(st) {
+  const pt = { ...(st._passthrough || {}) };
+  if ("_id" in pt) pt._id = toOid(pt._id);
   return {
-    ...(st._passthrough || {}),
+    ...pt,
     ticketKey: st.ticketKey, prefix: st.prefix, ticketType: st.ticketType,
     assignee: (st.assigneeRoles || []).map((r) => ({ roleId: r })),
     customFieldsMetaData: (st.customFieldsMetaData || []).map((f) => fieldToJson(f, true)),
@@ -264,8 +315,10 @@ function subTypeToJson(st) {
 }
 
 function docToJson(doc) {
+  const pt = { ...(doc._passthrough || {}) };
+  if ("_id" in pt) pt._id = toOid(pt._id); // string id -> { "$oid": "..." }
   const raw = {
-    ...(doc._passthrough || {}),
+    ...pt,
     ticketKey: doc.ticketKey, ticketType: doc.ticketType, tenantId: doc.tenantId,
     creators: doc.creators.map((r) => ({ roleId: r })),
     viewers: doc.viewers.map((r) => ({ roleId: r })),
@@ -436,7 +489,7 @@ function fieldFromJson(f) {
 
 function statusFromJson(s) {
   if (!s) return newStatus();
-  return {
+  return normalizeStatus({
     id: uid(), status: s.status || "", label: s.label || "", public: !!s.public,
     roles: Array.isArray(s.roles) ? s.roles : [],
     assigneeRoles: rolesFromJson(s.assignee),
@@ -454,7 +507,7 @@ function statusFromJson(s) {
       notificationType: Array.isArray(e.notificationType) ? e.notificationType : [],
       ccAddress: Array.isArray(e.ccAddress) ? e.ccAddress : [],
     })),
-  };
+  });
 }
 
 function subTypeFromJson(st) {
@@ -904,7 +957,7 @@ function xBuildStatusWorkflow(subtypeName, globalStatusRoles, mandateRules, esca
     const customFields = [];
     if (mandate.mandatoryImages) mandatoryFields.push("images");
     if (mandate.mandatoryComments) {
-      const key = xToCamelKey(mandate.commentsLabel || "Comments");
+      const key = mandate.commentsType === "fileUpload" ? STATUS_FILE_UPLOAD_KEY : xToCamelKey(mandate.commentsLabel || "Comments");
       mandatoryFields.push(key);
       customFields.push({ label: mandate.commentsLabel || "Comments", key, type: mandate.commentsType || "text" });
     }
@@ -1829,21 +1882,21 @@ function applyOpToLibrary(library, op) {
   }
   if (op.op === "addStatus") {
     if (!op.status || !op.status.status) return { library, applied: false, message: "Missing status definition" };
-    if (sub.statusWorkFlow.some((s) => xnorm(s.status).toLowerCase() === xnorm(op.status.status).toLowerCase())) {
+    if (sub.statusWorkFlow.some((s) => toStatusCode(s.status) === toStatusCode(op.status.status))) {
       return { library, applied: false, message: `Status "${op.status.status}" already exists on ${sub.ticketType || sub.ticketKey}` };
     }
     return withSub({ ...sub, statusWorkFlow: [...sub.statusWorkFlow, statusFromJson(op.status)] }, `Added status "${op.status.label || op.status.status}" to ${sub.ticketType || sub.ticketKey}`);
   }
   if (op.op === "removeStatus") {
-    if (!sub.statusWorkFlow.some((s) => xnorm(s.status).toLowerCase() === xnorm(op.statusCode).toLowerCase())) {
+    if (!sub.statusWorkFlow.some((s) => toStatusCode(s.status) === toStatusCode(op.statusCode))) {
       return { library, applied: false, message: `Status "${op.statusCode}" not found on ${sub.ticketType || sub.ticketKey}` };
     }
-    return withSub({ ...sub, statusWorkFlow: sub.statusWorkFlow.filter((s) => xnorm(s.status).toLowerCase() !== xnorm(op.statusCode).toLowerCase()) }, `Removed status "${op.statusCode}" from ${sub.ticketType || sub.ticketKey}`);
+    return withSub({ ...sub, statusWorkFlow: sub.statusWorkFlow.filter((s) => toStatusCode(s.status) !== toStatusCode(op.statusCode)) }, `Removed status "${op.statusCode}" from ${sub.ticketType || sub.ticketKey}`);
   }
 
   // everything below is additionally scoped to a status
   if (!op.statusCode) return { library, applied: false, message: `Missing statusCode for "${op.op}"` };
-  const statusIdx = sub.statusWorkFlow.findIndex((s) => xnorm(s.status).toLowerCase() === xnorm(op.statusCode).toLowerCase());
+  const statusIdx = sub.statusWorkFlow.findIndex((s) => toStatusCode(s.status) === toStatusCode(op.statusCode));
   if (statusIdx < 0) return { library, applied: false, message: `Status "${op.statusCode}" not found on ${sub.ticketType || sub.ticketKey}` };
   const status = sub.statusWorkFlow[statusIdx];
 
@@ -1877,6 +1930,7 @@ function applyOpToLibrary(library, op) {
         return { library, applied: false, message: `Field "${op.field.key}" already exists on "${status.label || op.statusCode}"` };
       }
       const newFieldObj = fieldFromJson(op.field);
+      if (newFieldObj.type === "fileUpload") newFieldObj.key = STATUS_FILE_UPLOAD_KEY;
       const mandatory = !!op.field.isMandatory || !!op.field.mandatory;
       return withStatus({
         ...status,
@@ -1985,8 +2039,8 @@ function diffDocsToOps(oldDoc, newDoc) {
       }
     });
 
-    const oldStatuses = new Map((oldSub.statusWorkFlow || []).map((s) => [xnorm(s.status).toLowerCase(), s]));
-    const newStatuses = new Map((newSub.statusWorkFlow || []).map((s) => [xnorm(s.status).toLowerCase(), s]));
+    const oldStatuses = new Map((oldSub.statusWorkFlow || []).map((s) => [toStatusCode(s.status), s]));
+    const newStatuses = new Map((newSub.statusWorkFlow || []).map((s) => [toStatusCode(s.status), s]));
 
     newStatuses.forEach((s, sk) => {
       const statusCode = s.status;
@@ -2486,7 +2540,7 @@ function CustomFieldEditor({ field, onChange, onDelete, restrictToDropdown }) {
     : FIELD_TYPES;
 
   const changeType = (type) => {
-    const base = { id: field.id, label: field.label, key: field.key, ...advancedDefaults() };
+    const base = { id: field.id, label: field.label, key: (restrictToDropdown && type === "fileUpload") ? STATUS_FILE_UPLOAD_KEY : field.key, ...advancedDefaults() };
     onChange({ ...newField(type), ...base, type });
   };
 
@@ -2503,7 +2557,9 @@ function CustomFieldEditor({ field, onChange, onDelete, restrictToDropdown }) {
         </div>
         <div>
           <Label mono hint="Internal id this value is stored under — no spaces">Field key</Label>
-          <Input mono value={field.key} onChange={(v) => onChange({ ...field, key: v })} placeholder="e.g. divisionCode" />
+          {restrictToDropdown && field.type === "fileUpload"
+            ? <Input mono value={STATUS_FILE_UPLOAD_KEY} onChange={() => {}} readOnly title="File upload fields always use this key" />
+            : <Input mono value={field.key} onChange={(v) => onChange({ ...field, key: v })} placeholder="e.g. divisionCode" />}
         </div>
       </div>
       <div className="mb-3">
@@ -2662,7 +2718,7 @@ function AutoEscalationList({ rules, onChange }) {
             </div>
             <div>
               <Label mono>Override status</Label>
-              <Input mono value={r.overrideStatus} onChange={(v) => update(r.id, { overrideStatus: v })} placeholder="rejected" />
+              <Input mono value={r.overrideStatus} onChange={(v) => update(r.id, { overrideStatus: toStatusCode(v) })} placeholder="rejected" />
             </div>
           </div>
           <div className="grid grid-cols-2 gap-3 mb-2">
@@ -2702,8 +2758,8 @@ function StatusEditor({ status, onChange, onDelete }) {
     >
       <div className="grid grid-cols-2 gap-3 mb-3">
         <div>
-          <Label mono hint="Internal id used by the workflow engine, no spaces">Status code</Label>
-          <Input mono value={status.status} onChange={(v) => onChange({ ...status, status: v })} placeholder="e.g. open" />
+          <Label mono hint="Internal id used by the workflow engine — lowercase, no spaces (e.g. resolvedandclosed)">Status code</Label>
+          <Input mono value={status.status} onChange={(v) => onChange({ ...status, status: toStatusCode(v) })} placeholder="e.g. open" />
         </div>
         <div>
           <Label hint="What people see on the ticket">Display label</Label>
@@ -2741,7 +2797,7 @@ function StatusEditor({ status, onChange, onDelete }) {
         </div>
         <div>
           <Label mono hint="Jump straight to this status code instead, if set">Override status on completion</Label>
-          <Input mono value={status.overrideStatus} onChange={(v) => onChange({ ...status, overrideStatus: v })} placeholder="e.g. closed" />
+          <Input mono value={status.overrideStatus} onChange={(v) => onChange({ ...status, overrideStatus: toStatusCode(v) })} placeholder="e.g. closed" />
         </div>
       </div>
 
@@ -2752,7 +2808,7 @@ function StatusEditor({ status, onChange, onDelete }) {
 
       <div className="mb-3">
         <Label mono hint="This status can only be reached after all of these are done">Depends on other status codes</Label>
-        <TagInput values={status.dependentStatus} onChange={(v) => onChange({ ...status, dependentStatus: v })} placeholder="status code, press enter" tone="indigo" />
+        <TagInput values={status.dependentStatus} onChange={(v) => onChange({ ...status, dependentStatus: v.map(toStatusCode).filter(Boolean) })} placeholder="status code, press enter" tone="indigo" />
       </div>
 
       <div className="mb-3">
@@ -2760,7 +2816,15 @@ function StatusEditor({ status, onChange, onDelete }) {
         <CustomFieldsList
           fields={status.customFieldsMetaData}
           restrictToDropdown
-          onChange={(fs) => onChange({ ...status, customFieldsMetaData: fs })}
+          onChange={(fs) => {
+            // keep mandatory list pointing at the right key when a field key changes
+            let mand = status.mandatoryCustomFields;
+            fs.forEach((nf) => {
+              const of = status.customFieldsMetaData.find((x) => x.id === nf.id);
+              if (of && of.key && of.key !== nf.key) mand = mand.map((k) => (k === of.key ? nf.key : k));
+            });
+            onChange({ ...status, customFieldsMetaData: fs, mandatoryCustomFields: [...new Set(mand)] });
+          }}
         />
       </div>
 
@@ -4394,7 +4458,7 @@ export default function App({ initialData } = {}) {
     copy.ticketType = src.ticketType ? `${src.ticketType} (copy)` : "";
     // it's a new entity — don't carry over backend-only passthrough fields
     // (e.g. _id) from the source, those belong to the original record only
-    copy._passthrough = {};
+    copy._passthrough = { _id: newOid() };
     // ...and every escalation level of the copy gets its own uuid
     copy.ticketSubType = copy.ticketSubType.map((s) => ({
       ...s,
