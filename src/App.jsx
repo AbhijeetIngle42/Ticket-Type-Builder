@@ -3,7 +3,7 @@ import {
   Plus, Trash2, ChevronDown, ChevronRight, Copy, Download,
   FileJson, Users, Ticket, ListTree, Workflow, Check, X,
   GripVertical, AlertTriangle, RefreshCw, FileSpreadsheet,
-  Sparkles, LayoutTemplate, Star, Wand2, Diff, ClipboardCopy, ClipboardPaste, Eraser, ChevronUp
+  Sparkles, LayoutTemplate, Star, Wand2, Diff, ClipboardCopy, ClipboardPaste, Eraser, ChevronUp, ShieldCheck
 } from "lucide-react";
 import * as XLSX from "xlsx-js-style";
 
@@ -1729,6 +1729,110 @@ function bulkEscalationPlan(library, opts) {
   });
   const totals = rows.reduce((t, r) => ({ subs: t.subs + r.subs, added: t.added + r.added, updated: t.updated + r.updated, removed: t.removed + r.removed }), { subs: 0, added: 0, updated: 0, removed: 0 });
   return { library: lib, rows, totals };
+}
+
+/* ------------------------------------------------------------------ */
+/* Bulk mandatory fields on status change                              */
+/* For the chosen ticket types + statuses, make sure each given field  */
+/* exists on the status (added if missing) and is listed in that       */
+/* status's mandatoryCustomFields. Mode "remove" only takes the key    */
+/* back out of mandatoryCustomFields (the field itself stays).         */
+/* A fileUpload field is matched by type, and a new one always gets    */
+/* the fixed key "uploadImage".                                        */
+/* ------------------------------------------------------------------ */
+const MANDATORY_FIELD_TYPES = [
+  { value: "fileUpload", label: "Image / file upload" },
+  { value: "text", label: "Text / comment" },
+  { value: "number", label: "Number" },
+  { value: "date", label: "Date" },
+  { value: "time", label: "Time" },
+];
+
+function labelToKey(label) {
+  const words = String(label || "").replace(/[^a-zA-Z0-9]+/g, " ").trim().split(" ").filter(Boolean);
+  return words.map((w, i) => (i === 0 ? w.toLowerCase() : w[0].toUpperCase() + w.slice(1).toLowerCase())).join("");
+}
+const mandatoryFieldKey = (f) => (f.type === "fileUpload" ? STATUS_FILE_UPLOAD_KEY : (xnorm(f.key) || labelToKey(f.label)));
+
+/* A "conflict" = the status already has a field with the SAME LABEL but a
+   different key (or type) than the one being added. The caller chooses what
+   to do per conflict (opts.resolutions[id]) or for all (opts.defaultRes):
+     keep     -> reuse the existing field as-is (its key) and make that mandatory
+     override -> rewrite the existing field to the new key/type/label
+     skip     -> change nothing for that field on that status
+   A conflict with no choice yet is treated as skip and counted as unresolved. */
+function bulkMandatoryPlan(library, opts) {
+  const codes = (opts.statuses || []).map(xToStatusCode).filter(Boolean);
+  const fields = (opts.fields || []).filter((f) => mandatoryFieldKey(f) && (opts.mode === "remove" || f.type === "fileUpload" || xnorm(f.label)));
+  const totals = { types: 0, subs: 0, statuses: 0, added: 0, marked: 0, removed: 0, overridden: 0, conflicts: 0, unresolved: 0 };
+  const reps = [];
+  const conflicts = [];
+  if (!codes.length || !fields.length) return { library, reps, conflicts, totals, ready: false };
+  const sameLabel = (a, b) => xnorm(a).toLowerCase() === xnorm(b).toLowerCase() && xnorm(a) !== "";
+  const lib = library.map((d) => {
+    if (!opts.allTypes && !opts.picked.includes(d._uid)) return d;
+    const rep = { uid: d._uid, name: d.ticketType || d.ticketKey || "(untitled)", subs: 0, statuses: 0, added: 0, marked: 0, removed: 0, overridden: 0, conflicts: 0, missing: [] };
+    const subs = d.ticketSubType.map((sub) => {
+      let hit = false;
+      const wf = sub.statusWorkFlow.map((w) => {
+        const wCode = xToStatusCode(w.status);
+        if (!codes.includes(wCode) && !codes.includes(xToStatusCode(w.label))) return w;
+        hit = true;
+        let cf = [...(w.customFieldsMetaData || [])];
+        let mand = [...(w.mandatoryCustomFields || [])];
+        let changed = false;
+        fields.forEach((f) => {
+          const key = mandatoryFieldKey(f);
+          const label = xnorm(f.label) || key;
+          const existing = cf.find((x) => (f.type === "fileUpload" ? x.type === "fileUpload" : xnorm(x.key).toLowerCase() === key.toLowerCase()));
+          const labelHit = existing ? null : cf.find((x) => sameLabel(x.label, label));
+
+          if (opts.mode === "remove") {
+            const useKey = (existing || labelHit || {}).key || key;
+            if (mand.includes(useKey)) { mand = mand.filter((k) => k !== useKey); rep.removed++; changed = true; }
+            return;
+          }
+
+          if (labelHit) {
+            const cid = `${sub.id}|${wCode}|${f.id}`;
+            const res = (opts.resolutions && opts.resolutions[cid]) || opts.defaultRes || "";
+            conflicts.push({
+              id: cid, typeName: rep.name, subName: sub.ticketType || sub.ticketKey || "(unnamed)",
+              statusLabel: w.label || w.status, fieldLabel: label,
+              existingKey: labelHit.key, existingType: labelHit.type, newKey: key, newType: f.type, res,
+            });
+            rep.conflicts++;
+            if (!res) return; // unresolved: leave untouched
+            if (res === "skip") return;
+            if (res === "keep") {
+              if (!mand.includes(labelHit.key)) { mand.push(labelHit.key); rep.marked++; changed = true; }
+              return;
+            }
+            // override: rewrite the existing field in place, swap the old key for the new one
+            cf = cf.map((x) => (x === labelHit ? { ...newSimpleField(f.type), id: labelHit.id, label, key } : x));
+            mand = mand.filter((k) => k !== labelHit.key);
+            if (!mand.includes(key)) mand.push(key);
+            rep.overridden++; rep.marked++; changed = true;
+            return;
+          }
+
+          const useKey = existing ? existing.key : key;
+          if (!existing) { cf.push({ ...newSimpleField(f.type), label, key: useKey }); rep.added++; changed = true; }
+          if (!mand.includes(useKey)) { mand.push(useKey); rep.marked++; changed = true; }
+        });
+        if (!changed) return w;
+        rep.statuses++;
+        return { ...w, customFieldsMetaData: cf, mandatoryCustomFields: mand };
+      });
+      if (hit) rep.subs++; else rep.missing.push(sub.ticketType || sub.ticketKey || "(unnamed)");
+      return { ...sub, statusWorkFlow: wf };
+    });
+    reps.push(rep);
+    return { ...d, ticketSubType: subs };
+  });
+  reps.forEach((r) => { totals.types++; ["subs", "statuses", "added", "marked", "removed", "overridden", "conflicts"].forEach((k) => { totals[k] += r[k]; }); });
+  totals.unresolved = conflicts.filter((c) => !c.res).length;
+  return { library: lib, reps, conflicts, totals, ready: true };
 }
 
 function templateFromRawJson(raw, name) {
@@ -4153,6 +4257,279 @@ function BulkEscalationTab({ library, onApply }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Bulk mandatory fields tab                                           */
+/* ------------------------------------------------------------------ */
+
+const presetResolutionImages = () => ({ id: uid(), type: "fileUpload", label: "Resolution Images", key: "" });
+const presetActionTaken = () => ({ id: uid(), type: "text", label: "Action Taken", key: "" });
+
+function BulkMandatoryTab({ library, onApply }) {
+  const [allTypes, setAllTypes] = useState(true);
+  const [picked, setPicked] = useState([]);
+  const [statusText, setStatusText] = useState("");
+  const [mode, setMode] = useState("add");
+  const [fields, setFields] = useState([presetResolutionImages(), presetActionTaken()]);
+  const [defaultRes, setDefaultRes] = useState(""); // "" | keep | override | skip — for same-label/different-key conflicts
+  const [resolutions, setResolutions] = useState({}); // per-conflict overrides of the default
+
+  const cellInput = "w-full rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-1.5 text-sm text-white placeholder:text-slate-600 outline-none focus:border-indigo-400";
+  const statuses = statusText.split(/[,;\n]+/).map((x) => x.trim()).filter(Boolean);
+  const statusCodes = statuses.map(xToStatusCode);
+
+  // statuses that actually exist in the chosen ticket types (click to add)
+  const found = useMemo(() => {
+    const map = new Map();
+    library.forEach((d) => {
+      if (!allTypes && !picked.includes(d._uid)) return;
+      d.ticketSubType.forEach((sub) => sub.statusWorkFlow.forEach((w) => {
+        const code = xToStatusCode(w.status || w.label);
+        if (!code) return;
+        const cur = map.get(code) || { code, label: w.label || w.status, count: 0 };
+        cur.count++;
+        map.set(code, cur);
+      }));
+    });
+    return [...map.values()].sort((a, b) => b.count - a.count);
+  }, [library, allTypes, picked]);
+
+  const plan = useMemo(
+    () => bulkMandatoryPlan(library, { allTypes, picked, statuses, fields, mode, defaultRes, resolutions }),
+    [library, allTypes, picked, statusText, fields, mode, defaultRes, resolutions], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const changes = plan.totals.added + plan.totals.marked + plan.totals.removed;
+  const RES_LABEL = { keep: "Keep existing", override: "Override", skip: "No change" };
+
+  const toggleStatus = (code) => {
+    if (statusCodes.includes(code)) setStatusText(statuses.filter((x) => xToStatusCode(x) !== code).join(", "));
+    else setStatusText([...statuses, code].join(", "));
+  };
+  const setField = (id, patch) => setFields((fs) => fs.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+  const togglePicked = (uidVal, on) => setPicked((p) => (on ? [...p, uidVal] : p.filter((x) => x !== uidVal)));
+
+  const apply = () => {
+    const t = plan.totals;
+    if (t.unresolved > 0) {
+      window.alert(`${t.unresolved} field${t.unresolved === 1 ? "" : "s"} already exist${t.unresolved === 1 ? "s" : ""} with the same label but a different key.\n\nChoose Keep existing, Override or No change (in the yellow box) before applying.`);
+      return;
+    }
+    if (!changes) return;
+    const parts = mode === "remove"
+      ? [`stop requiring ${t.removed} field${t.removed === 1 ? "" : "s"}`]
+      : [t.added ? `add ${t.added} missing field${t.added === 1 ? "" : "s"}` : "", t.marked ? `make ${t.marked} field${t.marked === 1 ? "" : "s"} mandatory` : "", t.overridden ? `override ${t.overridden} existing same-label field${t.overridden === 1 ? "" : "s"} (new key)` : ""].filter(Boolean);
+    if (!window.confirm(`On the ${statuses.join(", ")} status${statuses.length === 1 ? "" : "es"} of ${t.subs} sub-type${t.subs === 1 ? "" : "s"}: ${parts.join(" and ")}.\n\nContinue?`)) return;
+    onApply(plan.library, plan.totals, mode);
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="rounded-xl border border-white/10 bg-[#0D1220] p-4 text-sm text-white">
+        <p className="font-medium mb-1">Make fields mandatory when a ticket moves to a status — for many sub-types at once</p>
+        <p className="text-xs text-white/70">
+          1) pick the ticket types, 2) pick the statuses (e.g. resolved, closed), 3) say which fields must be filled. A field that isn't on the status yet is
+          added to it, then listed in its mandatory fields. Image uploads always use the key <span className="font-mono">{STATUS_FILE_UPLOAD_KEY}</span>.
+        </p>
+      </div>
+
+      {/* 1. ticket types */}
+      <div>
+        <Label hint="Which ticket types should be changed">1 · Ticket types</Label>
+        <div className="rounded-xl border border-white/10 bg-[#111528] p-3">
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-white">
+            <Checkbox checked={allTypes} onChange={setAllTypes} title="Apply to every ticket type" />All ticket types ({library.length})
+          </label>
+          {!allTypes && (
+            <div className="mt-2 grid grid-cols-1 gap-x-4 gap-y-1.5 md:grid-cols-2 max-h-56 overflow-y-auto">
+              {library.length === 0 && <p className="text-xs text-white/70">No ticket types loaded yet.</p>}
+              {library.map((d) => (
+                <label key={d._uid} className="flex cursor-pointer items-center gap-2 text-sm text-white">
+                  <Checkbox checked={picked.includes(d._uid)} onChange={(on) => togglePicked(d._uid, on)} title="Include this ticket type" />
+                  <span className="truncate">{d.ticketType || d.ticketKey || "(untitled)"}</span>
+                  <span className="text-xs text-white/60">{d.ticketSubType.length} sub</span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 2. statuses */}
+      <div>
+        <Label hint="Status code or label, comma separated">2 · Statuses</Label>
+        <Input mono value={statusText} onChange={setStatusText} placeholder="resolved, closed" />
+        {found.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <span className="text-xs text-white/60">In these ticket types:</span>
+            {found.map((st) => {
+              const on = statusCodes.includes(st.code);
+              return (
+                <button
+                  key={st.code} type="button" onClick={() => toggleStatus(st.code)}
+                  className={`rounded-full border px-2.5 py-0.5 text-xs ${on ? "border-indigo-400 bg-indigo-500/20 text-indigo-100" : "border-white/10 text-white/80 hover:border-white/30"}`}
+                  title={`${st.count} sub-type${st.count === 1 ? "" : "s"} have this status`}
+                >{st.label || st.code} <span className="text-white/50">· {st.count}</span></button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* 3. fields */}
+      <div>
+        <div className="flex items-end justify-between gap-3">
+          <Label hint="What must be filled when moving to those statuses">3 · Mandatory fields</Label>
+          <div className="mb-1 flex gap-2">
+            <Btn variant="ghost" small onClick={() => setFields((fs) => [...fs, presetResolutionImages()])}><Plus size={13} />Resolution Images</Btn>
+            <Btn variant="ghost" small onClick={() => setFields((fs) => [...fs, presetActionTaken()])}><Plus size={13} />Action Taken</Btn>
+            <Btn variant="dashed" small onClick={() => setFields((fs) => [...fs, { id: uid(), type: "text", label: "", key: "" }])}><Plus size={13} />Other field</Btn>
+          </div>
+        </div>
+        <div className="overflow-x-auto rounded-xl border border-white/10 bg-[#111528]">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-[11px] uppercase tracking-wider text-white">
+                <th className="px-3 py-2.5 min-w-[170px]">Type</th>
+                <th className="px-3 py-2.5 min-w-[200px]">Label</th>
+                <th className="px-3 py-2.5 min-w-[170px]">Key</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {fields.length === 0 && <tr><td colSpan={4} className="px-3 py-6 text-center text-xs text-white/70">Add at least one field.</td></tr>}
+              {fields.map((f) => (
+                <tr key={f.id} className="border-t border-white/5">
+                  <td className="px-3 py-2">
+                    <select value={f.type} onChange={(e) => setField(f.id, { type: e.target.value })} className={cellInput}>
+                      {MANDATORY_FIELD_TYPES.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+                    </select>
+                  </td>
+                  <td className="px-3 py-2"><input value={f.label} onChange={(e) => setField(f.id, { label: e.target.value })} placeholder="e.g. Action Taken" className={cellInput} /></td>
+                  <td className="px-3 py-2">
+                    {f.type === "fileUpload"
+                      ? <input value={STATUS_FILE_UPLOAD_KEY} disabled className={`${cellInput} font-mono opacity-60`} title="Fixed key for image uploads" />
+                      : <input value={f.key} onChange={(e) => setField(f.id, { key: e.target.value })} placeholder={labelToKey(f.label) || "auto from label"} className={`${cellInput} font-mono`} />}
+                  </td>
+                  <td className="px-2 py-2"><IconBtn danger title="Remove field" onClick={() => setFields((fs) => fs.filter((x) => x.id !== f.id))}><Trash2 size={14} /></IconBtn></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {mode === "add" && plan.conflicts.length > 0 && (
+        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
+          <div className="flex items-start gap-2">
+            <AlertTriangle size={16} className="mt-0.5 shrink-0 text-amber-400" />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-medium text-amber-100">
+                {plan.conflicts.length} field{plan.conflicts.length === 1 ? "" : "s"} already exist with the same label but a different key
+                {plan.totals.unresolved > 0 && <span className="text-rose-300"> — {plan.totals.unresolved} still need a decision</span>}
+              </p>
+              <p className="mt-0.5 text-xs text-amber-200/80">
+                Keep existing = leave that field as it is and just make its current key mandatory · Override = change its key/type to the new one · No change = skip it.
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <span className="text-xs text-amber-100">For all of them:</span>
+                <select value={defaultRes} onChange={(e) => setDefaultRes(e.target.value)} className={`${cellInput} !w-auto`}>
+                  <option value="">— choose —</option>
+                  <option value="keep">Keep existing</option>
+                  <option value="override">Override with the new key</option>
+                  <option value="skip">No change</option>
+                </select>
+                {Object.keys(resolutions).length > 0 && <button type="button" onClick={() => setResolutions({})} className="text-xs text-amber-200 underline hover:text-amber-100">reset individual choices</button>}
+              </div>
+              <div className="mt-3 max-h-64 overflow-auto rounded-lg border border-white/10 bg-[#0B0F1C]">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-left uppercase tracking-wider text-white/70">
+                      <th className="px-2 py-1.5">Where</th>
+                      <th className="px-2 py-1.5">Label</th>
+                      <th className="px-2 py-1.5">Existing key</th>
+                      <th className="px-2 py-1.5">New key</th>
+                      <th className="px-2 py-1.5">Decision</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {plan.conflicts.map((c) => (
+                      <tr key={c.id} className="border-t border-white/5">
+                        <td className="px-2 py-1.5 text-white">{c.typeName} › {c.subName} › {c.statusLabel}</td>
+                        <td className="px-2 py-1.5 text-white">{c.fieldLabel}</td>
+                        <td className="px-2 py-1.5 font-mono text-white">{c.existingKey}<span className="text-white/50"> ({c.existingType})</span></td>
+                        <td className="px-2 py-1.5 font-mono text-white">{c.newKey}<span className="text-white/50"> ({c.newType})</span></td>
+                        <td className="px-2 py-1.5">
+                          <select
+                            value={resolutions[c.id] || ""}
+                            onChange={(e) => setResolutions((r) => { const n = { ...r }; if (e.target.value) n[c.id] = e.target.value; else delete n[c.id]; return n; })}
+                            className={`${cellInput} !py-1 ${c.res ? "" : "ring-1 ring-rose-500/60"}`}
+                          >
+                            <option value="">{defaultRes ? `Default (${RES_LABEL[defaultRes]})` : "Choose…"}</option>
+                            <option value="keep">Keep existing</option>
+                            <option value="override">Override</option>
+                            <option value="skip">No change</option>
+                          </select>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <div>
+          <Label>Action</Label>
+          <select value={mode} onChange={(e) => setMode(e.target.value)} className={cellInput}>
+            <option value="add">Make these fields mandatory (add them if missing)</option>
+            <option value="remove">Stop requiring them (the fields stay on the status)</option>
+          </select>
+        </div>
+      </div>
+
+      {/* preview */}
+      <div className="overflow-x-auto rounded-xl border border-white/10 bg-[#111528]">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-[11px] uppercase tracking-wider text-white">
+              <th className="px-3 py-2.5">Ticket type</th>
+              <th className="px-3 py-2.5">Sub-types hit</th>
+              <th className="px-3 py-2.5">Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            {!plan.ready && <tr><td colSpan={3} className="px-3 py-6 text-center text-xs text-white/70">Pick the statuses and fields above to see what will change.</td></tr>}
+            {plan.ready && plan.reps.length === 0 && <tr><td colSpan={3} className="px-3 py-6 text-center text-xs text-white/70">No ticket types selected.</td></tr>}
+            {plan.reps.map((r) => (
+              <tr key={r.uid} className="border-t border-white/5 align-top">
+                <td className="px-3 py-2 text-white">{r.name}</td>
+                <td className="px-3 py-2 text-white">{r.subs}</td>
+                <td className="px-3 py-2 text-xs leading-5">
+                  {mode === "remove"
+                    ? <span className="text-rose-300">−{r.removed} no longer mandatory</span>
+                    : <><span className="text-emerald-300">+{r.added} field{r.added === 1 ? "" : "s"} added</span><span className="text-sky-300"> · {r.marked} marked mandatory</span>{r.overridden > 0 && <span className="text-amber-300"> · {r.overridden} overridden</span>}{r.conflicts > 0 && <span className="text-amber-300"> · {r.conflicts} same-label conflict{r.conflicts === 1 ? "" : "s"}</span>}</>}
+                  {r.missing.length > 0 && <div className="text-amber-300" title={r.missing.join("\n")}>{r.missing.length} sub-type{r.missing.length === 1 ? "" : "s"} have none of these statuses</div>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-sm text-white">
+          {changes
+            ? (mode === "remove" ? `${plan.totals.removed} to un-require` : `${plan.totals.added} fields to add · ${plan.totals.marked} to mark mandatory${plan.totals.overridden ? ` · ${plan.totals.overridden} to override` : ""}`) + `, across ${plan.totals.subs} sub-types`
+            : "Nothing to change yet"}
+        </span>
+        <div className="ml-auto"><Btn variant="accent" onClick={apply}><Check size={15} />Apply to selected sub-types</Btn></div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* App                                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -4709,11 +5086,23 @@ export default function App({ initialData } = {}) {
     });
   };
 
+  const applyBulkMandatory = (nextLibrary, totals, mode) => {
+    setLibrary(nextLibrary);
+    showToast({
+      type: "success",
+      title: mode === "remove" ? "Mandatory fields removed" : "Mandatory fields applied",
+      lines: [mode === "remove"
+        ? `${totals.removed} field${totals.removed === 1 ? "" : "s"} no longer mandatory across ${totals.subs} sub-types.`
+        : `${totals.added} field${totals.added === 1 ? "" : "s"} added, ${totals.marked} marked mandatory${totals.overridden ? `, ${totals.overridden} overridden` : ""} across ${totals.subs} sub-types.`],
+    });
+  };
+
   const nav = [
     { id: "library", label: `Ticket Types (${library.length})`, icon: <ListTree size={16} /> },
     { id: "templates", label: `Templates (${templates.length})`, icon: <LayoutTemplate size={16} /> },
     { id: "smartupdate", label: "Smart Update", icon: <Wand2 size={16} /> },
     { id: "bulkesc", label: "Bulk Escalation", icon: <AlertTriangle size={16} /> },
+    { id: "bulkmand", label: "Bulk Mandatory", icon: <ShieldCheck size={16} /> },
     { id: "details", label: "Details", icon: <Ticket size={16} /> },
     { id: "roles", label: "Roles", icon: <Users size={16} /> },
     { id: "subtypes", label: `Sub-Types (${selected ? selected.ticketSubType.length : 0})`, icon: <ListTree size={16} /> },
@@ -4743,7 +5132,7 @@ export default function App({ initialData } = {}) {
         </div>
         <nav className="flex-1 px-2 py-4 space-y-1">
           {nav.map((n) => {
-            const disabled = n.id !== "library" && n.id !== "templates" && n.id !== "smartupdate" && n.id !== "bulkesc" && !selected;
+            const disabled = n.id !== "library" && n.id !== "templates" && n.id !== "smartupdate" && n.id !== "bulkesc" && n.id !== "bulkmand" && !selected;
             return (
               <button
                 key={n.id}
@@ -4769,10 +5158,10 @@ export default function App({ initialData } = {}) {
         <header className="bg-[#0A0E1C] border-b border-white/10 px-8 py-4 flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-base font-semibold text-white truncate">
-              {tab === "library" ? "All ticket types" : tab === "templates" ? "Sub-type templates" : tab === "smartupdate" ? "Smart update" : tab === "bulkesc" ? "Bulk escalation" : (selected ? (selected.ticketType || "Untitled ticket type") : "No ticket type selected")}
+              {tab === "library" ? "All ticket types" : tab === "templates" ? "Sub-type templates" : tab === "smartupdate" ? "Smart update" : tab === "bulkesc" ? "Bulk escalation" : tab === "bulkmand" ? "Bulk mandatory fields" : (selected ? (selected.ticketType || "Untitled ticket type") : "No ticket type selected")}
             </h1>
             <p className="text-xs font-mono text-white">
-              {tab === "library" ? `${library.length} loaded` : tab === "templates" ? `${templates.length} template${templates.length === 1 ? "" : "s"} available for bulk creation` : tab === "smartupdate" ? "describe changes, review the diff, then apply" : tab === "bulkesc" ? "bulk-add escalation levels" : (selected ? (selected.ticketKey || "no key set yet") : "pick one from Ticket Types")}
+              {tab === "library" ? `${library.length} loaded` : tab === "templates" ? `${templates.length} template${templates.length === 1 ? "" : "s"} available for bulk creation` : tab === "smartupdate" ? "describe changes, review the diff, then apply" : tab === "bulkesc" ? "bulk-add escalation levels" : tab === "bulkmand" ? "require fields when a status is reached" : (selected ? (selected.ticketKey || "no key set yet") : "pick one from Ticket Types")}
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -4817,7 +5206,7 @@ export default function App({ initialData } = {}) {
           </div>
         )}
 
-        <div className={(tab === "library" || tab === "templates" || tab === "smartupdate" || tab === "bulkesc") ? "px-8 py-6" : "px-8 py-6 max-w-4xl"}>
+        <div className={(tab === "library" || tab === "templates" || tab === "smartupdate" || tab === "bulkesc" || tab === "bulkmand") ? "px-8 py-6" : "px-8 py-6 max-w-4xl"}>
           {tab === "library" && (
             <LibraryTab
               library={library}
@@ -4851,6 +5240,7 @@ export default function App({ initialData } = {}) {
             <SmartUpdateTab library={library} onApply={applySmartUpdate} onExportExcel={exportAllToExcel} />
           )}
           {tab === "bulkesc" && <BulkEscalationTab library={library} onApply={applyBulkEscalation} />}
+          {tab === "bulkmand" && <BulkMandatoryTab library={library} onApply={applyBulkMandatory} />}
           {tab === "details" && selected && <DetailsTab doc={selected} onChange={updateSelected} />}
           {tab === "roles" && selected && <RolesTab doc={selected} onChange={updateSelected} />}
           {tab === "subtypes" && selected && (
