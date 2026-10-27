@@ -575,6 +575,33 @@ function xRowsOf(sheet) {
 const xCell = (row, i) => (i < row.length ? row[i] : null);
 const xFindCol = (header, needle) => header.findIndex((h) => h.includes(needle));
 
+/* ---- Less typing: blank cells are filled in from what is already known ----
+   Prefix        <- Ticket Details "Prefix", else ${locationId}-<TICKET KEY>
+   Subtype key   <- the sub-type's name
+   Assignee      <- the ticket type's Assignee Roles
+   Sub-types     <- the "Sub Types" list in Ticket Details (one comma separated cell)
+   Status flow   <- one block with a blank Ticket Key / Ticket Subtype serves every sub-type
+   Role cells accept <assignee> <creators> <viewers> <ticket assignee> instead of typing role ids. */
+const xDerivedPrefix = (ticketKey) => "${locationId}-" + xnorm(ticketKey).toUpperCase().replace(/[^A-Z0-9&]+/g, "-").replace(/^-+|-+$/g, "");
+const xSplitList = (v) => xnorm(v).split(/[,;\n]+/).map((x) => x.trim()).filter(Boolean);
+const X_ALL = "*";
+const xIsAllLabel = (v) => /^\(?\s*all(\s+sub-?\s?types?)?\s*\)?$/i.test(xnorm(v));
+/* "<assignee>" -> that sub-type's assignee roles, "<creators>", "<viewers>", "<ticket assignee>" -> the ticket type's lists */
+function xResolveRoleTokens(roles, ctx) {
+  const out = [];
+  (roles || []).forEach((r) => {
+    const raw = xnorm(r);
+    if (!/^[<{[]/.test(raw)) { out.push(raw); return; }
+    const k = raw.replace(/[<>{}[\]]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (/^(ticket|root) (type )?assignee/.test(k)) out.push(...ctx.ticketAssignee);
+    else if (/^(sub ?type )?assignee/.test(k)) out.push(...ctx.assignee);
+    else if (/^creator/.test(k)) out.push(...ctx.creators);
+    else if (/^viewer/.test(k)) out.push(...ctx.viewers);
+    else out.push(raw);
+  });
+  return [...new Set(out.filter(Boolean))];
+}
+
 /* Returns an array — one entry per row — so a single "Ticket Details"
    sheet can describe several ticket types at once. Each row is keyed by
    its own Ticket Key, which every other sheet also references. */
@@ -591,6 +618,8 @@ function xParseTicketDetails(sheet) {
     viewers: xSplitRoles(xCell(r, col("viewer"))),
     assignee: xSplitRoles(xCell(r, col("assignee"))),
     deleted: xIsYes(xCell(r, col("delete"))),
+    prefix: xnorm(xCell(r, col("prefix"))),
+    subTypeNames: xSplitList(xCell(r, col("sub type"))),
   })).filter((d) => d.ticketKey || d.ticketType);
 }
 
@@ -607,16 +636,20 @@ function xParseSubTypes(sheet) {
   const header = rows[0].map((h) => xnorm(h).toLowerCase());
   const col = (n) => xFindCol(header, n);
   const hasTicketCol = col("ticket key") !== -1;
+  let lastKey = "__default__"; // Ticket Key sticks down: only the first row of a ticket type needs it
   for (const r of rows.slice(1)) {
     const name = xnorm(xCell(r, col("ticket subtype")));
+    const keyCell = hasTicketCol ? xnorm(xCell(r, col("ticket key"))) : "";
+    if (keyCell) lastKey = keyCell;
     if (!name) continue;
-    const ticketKey = hasTicketCol ? (xnorm(xCell(r, col("ticket key"))) || "__default__") : "__default__";
+    const ticketKey = hasTicketCol ? lastKey : "__default__";
     const key = xnorm(xCell(r, col("subtype key"))) || name;
     byTicket[ticketKey] = byTicket[ticketKey] || { subtypes: {}, order: [] };
     byTicket[ticketKey].subtypes[name] = {
       ticketKey: key,
       prefix: xnorm(xCell(r, col("prefix"))),
       assigneeRoles: xSplitRoles(xCell(r, col("assignee"))),
+      prefixGiven: !!xnorm(xCell(r, col("prefix"))),
       isAutoEscalation: xIsYes(xCell(r, col("auto escalation"))),
       deleted: xIsYes(xCell(r, col("delete"))),
       ticketType: name,
@@ -642,6 +675,7 @@ function xParseTicketStructure(sheet, subtypesByTicket) {
   let currentField = null;
   const optionBased = ["dropdown", "radio", "multiplechoice"];
   const touched = new Set();
+  const commonFields = {}; // ticketKey -> fields written with no sub-type: added to every sub-type
   for (const r of rows.slice(1)) {
     const ticketKeyCell = offset ? xnorm(xCell(r, 0)) : "";
     const subtypeCell = xnorm(xCell(r, offset + 0));
@@ -650,8 +684,8 @@ function xParseTicketStructure(sheet, subtypesByTicket) {
     const mandatoryCell = xnorm(xCell(r, offset + 3));
     const rolesCell = xnorm(xCell(r, offset + 4));
 
-    if (ticketKeyCell) currentTicketKey = ticketKeyCell;
-    if (subtypeCell) currentSubtype = subtypeCell;
+    if (ticketKeyCell) { if (ticketKeyCell !== currentTicketKey) currentSubtype = null; currentTicketKey = ticketKeyCell; }
+    if (subtypeCell) currentSubtype = xIsAllLabel(subtypeCell) ? X_ALL : subtypeCell;
     touched.add(currentTicketKey);
 
     const bucket = subtypesByTicket[currentTicketKey];
@@ -672,7 +706,8 @@ function xParseTicketStructure(sheet, subtypesByTicket) {
 
       currentField = { label: cleanLabel, key: xToCamelKey(cleanLabel), type: ftype, editRoles: xSplitRoles(rolesCell), isMandatory: xIsYes(mandatoryCell), options: [] };
       if (typeCell && optionBased.includes(ftype)) currentField.options.push({ value: typeCell, key: "" });
-      if (currentSubtype && bucket && bucket.subtypes[currentSubtype]) bucket.subtypes[currentSubtype].customFieldsMetaData.push(currentField);
+      if (!currentSubtype || currentSubtype === X_ALL) (commonFields[currentTicketKey] = commonFields[currentTicketKey] || []).push(currentField);
+      else if (bucket && bucket.subtypes[currentSubtype]) bucket.subtypes[currentSubtype].customFieldsMetaData.push(currentField);
       continue;
     }
     if (currentField && typeCell) currentField.options.push({ value: typeCell, key: "" });
@@ -681,6 +716,7 @@ function xParseTicketStructure(sheet, subtypesByTicket) {
     const bucket = subtypesByTicket[tk];
     if (!bucket) return;
     Object.values(bucket.subtypes).forEach((st) => {
+      if ((commonFields[tk] || []).length) st.customFieldsMetaData = [...commonFields[tk].map((f) => JSON.parse(JSON.stringify(f))), ...st.customFieldsMetaData];
       st.customFieldsMetaData.forEach((f) => {
         if (optionBased.includes(f.type) && !f.options.length) f.type = "text";
         f.options.forEach((o, i) => { if (!o.key) o.key = String(i + 1); });
@@ -723,7 +759,11 @@ function xStatusSheetRows(sheet) {
     }
     const label = xnorm(xCell(r, offset));
     if (!label) continue;
-    items.push({ scope: xScopeKey(curKey, curSub), r, label });
+    // optional "Status Code" column (written by the exporter): the real status code, so two
+    // statuses that share a label ("Approve", "Reject" ...) stay two different statuses
+    const codeCol = headerRow.findIndex((h) => h.includes("status code"));
+    const code = codeCol >= 0 ? toStatusCode(xCell(r, codeCol)) : "";
+    items.push({ scope: xScopeKey(curKey, curSub), r, label, code: code || xToStatusCode(label) });
   }
   return { headerRow, offset, items };
 }
@@ -734,11 +774,11 @@ function xParseStatusAccessRoles(sheet) {
   const { headerRow, offset, items } = xStatusSheetRows(sheet);
   const publicCol = headerRow.findIndex((h) => h.includes("public"));
   const byScope = {};
-  for (const { scope, r, label } of items) {
+  for (const { scope, r, label, code } of items) {
     byScope[scope] = byScope[scope] || {};
     // optional "Public" column: Yes/No overrides the default (only "open" is public)
     const publicCell = publicCol >= 0 ? xnorm(xCell(r, publicCol)) : "";
-    byScope[scope][xToStatusCode(label)] = {
+    byScope[scope][code] = {
       label, roles: xSplitRoles(xCell(r, offset + 1)),
       public: publicCell ? xIsYes(publicCell) : undefined,
     };
@@ -768,7 +808,7 @@ function xParseMandateRules(sheet) {
   const assigneeYnCol = find((h) => h.includes("assignee") && !h.includes("role"), offset + 3);
   const roleCol = find((h) => h.includes("assignee") && h.includes("role"), offset + 4);
   const byTicket = {};
-  for (const { scope: ticketKey, r, label } of items) {
+  for (const { scope: ticketKey, r, label, code } of items) {
     const imagesCell = xnorm(xCell(r, imagesCol));
     const commentsCell = xnorm(xCell(r, commentsCol));
     const labelCell = labelCol >= 0 ? xnorm(xCell(r, labelCol)) : "";
@@ -788,10 +828,11 @@ function xParseMandateRules(sheet) {
     // a "(Number)" / "(Date)" / "(Text)" suffix on the label sets the remark field's type
     const typeMatch = rawLabel.match(/\((text|number|date)\)\s*$/i);
     if (typeMatch) rawLabel = rawLabel.replace(/\((text|number|date)\)\s*$/i, "").trim();
-    const commentsType = ["text", "number", "date"].includes(typeCell) ? typeCell : (typeMatch ? typeMatch[1].toLowerCase() : "text");
+    const commentsType = typeCell === "fileupload" ? "fileUpload"
+      : ["text", "number", "date"].includes(typeCell) ? typeCell : (typeMatch ? typeMatch[1].toLowerCase() : "text");
 
     byTicket[ticketKey] = byTicket[ticketKey] || {};
-    byTicket[ticketKey][xToStatusCode(label)] = {
+    byTicket[ticketKey][code] = {
       mandatoryImages: xYesish(imagesCell),
       mandatoryComments: !commentsOff,
       commentsLabel: rawLabel || "Comments",
@@ -888,6 +929,7 @@ function xParseEscalationRows(rows, headerIdx) {
   const cType = find((h) => h.includes("notification") && h.includes("type"));
   const cCc = find((h) => h.includes("cc"));
   const cOver = find((h) => h.includes("override"));
+  const cCode = find((h) => h.includes("status code"));
   const escalationByTicket = {};
   const warnings = [];
   let key = "__default__";
@@ -897,14 +939,16 @@ function xParseEscalationRows(rows, headerIdx) {
     const k = xnorm(xCell(r, 0));
     if (k) { key = k; sub = ""; status = ""; }
     const sv = cSub >= 0 ? xnorm(xCell(r, cSub)) : "";
-    if (sv) { sub = sv; status = ""; }
+    if (sv) { sub = xIsAllLabel(sv) ? X_ALL : sv; status = ""; }
     const stv = cStatus >= 0 ? xnorm(xCell(r, cStatus)) : "";
-    if (stv) status = xToStatusCode(stv);
+    const codeV = cCode >= 0 ? toStatusCode(xCell(r, cCode)) : "";
+    if (stv || codeV) status = codeV || xToStatusCode(stv);
     const days = cDays >= 0 ? xnorm(xCell(r, cDays)) : "";
     const role = cRole >= 0 ? xnorm(xCell(r, cRole)) : "";
     if (!days && !role) continue;
-    if (!sub || !status) { warnings.push(`Escalation row (${role || days}) has no Ticket Subtype or Status above it — skipped.`); continue; }
-    if (!role) { warnings.push(`Escalation for '${sub}' under ${status} has Days but no Assignee Role — skipped that level.`); continue; }
+    if (!status) { warnings.push(`Escalation row (${role || days}) has no Status above it — skipped.`); continue; }
+    const subUse = sub || X_ALL; // a blank Ticket Subtype means every sub-type of that ticket type
+    if (!role) { warnings.push(`Escalation for '${subUse === X_ALL ? "all sub-types" : subUse}' under ${status} has Days but no Assignee Role — skipped that level.`); continue; }
     const notifCell = cNotif >= 0 ? xnorm(xCell(r, cNotif)) : "";
     const types = cType >= 0 ? xNotifTypes(xCell(r, cType)) : [];
     const ccCell = cCc >= 0 ? xnorm(xCell(r, cCc)) : "";
@@ -921,7 +965,7 @@ function xParseEscalationRows(rows, headerIdx) {
     };
     const bucket = (escalationByTicket[key] = escalationByTicket[key] || {});
     const bySub = (bucket[status] = bucket[status] || {});
-    (bySub[sub] = bySub[sub] || []).push(entry);
+    (bySub[subUse] = bySub[subUse] || []).push(entry);
   }
   // Level decides the order inside a (ticket, sub-type, status) group; rows may sit anywhere in the sheet.
   Object.values(escalationByTicket).forEach((byStatus) => Object.values(byStatus).forEach((bySub) => Object.keys(bySub).forEach((sub) => {
@@ -951,7 +995,7 @@ function xBuildStatusWorkflow(subtypeName, globalStatusRoles, mandateRules, esca
   return orderedCodes.map((code) => {
     const roleInfo = globalStatusRoles[code] || {};
     const mandate = mandateRules[code] || {};
-    const escRows = (escalationByStatus[code] || {})[subtypeName] || [];
+    const escRows = (escalationByStatus[code] || {})[subtypeName] || (escalationByStatus[code] || {})[X_ALL] || [];
 
     const mandatoryFields = [];
     const customFields = [];
@@ -1288,6 +1332,21 @@ function excelWorkbookToDocs(wb) {
 
   const detailsRows = sheets.details ? xParseTicketDetails(sheets.details) : [];
   const subtypesByTicket = sheets.subtypes ? xParseSubTypes(sheets.subtypes) : {};
+  // Sub-types typed in Ticket Details ("Sub Types" cell) are created here, before the field sheet is read,
+  // so common fields reach them too. Everything they don't say is filled in below.
+  const autoNote = { created: 0, prefix: 0, assignee: 0 };
+  detailsRows.forEach((d) => {
+    const effKey = d.ticketKey || d.ticketType;
+    if (!d.subTypeNames.length) return;
+    const bk = !subtypesByTicket[effKey] && subtypesByTicket.__default__ && detailsRows.length === 1 ? "__default__" : effKey;
+    const bucket = (subtypesByTicket[bk] = subtypesByTicket[bk] || { subtypes: {}, order: [] });
+    d.subTypeNames.forEach((name) => {
+      if (bucket.subtypes[name]) return;
+      bucket.subtypes[name] = { ticketKey: name, prefix: "", prefixGiven: false, assigneeRoles: [], isAutoEscalation: false, deleted: false, ticketType: name, customFieldsMetaData: [], statusWorkFlow: [] };
+      bucket.order.push(name);
+      autoNote.created++;
+    });
+  });
   if (sheets.structure) xParseTicketStructure(sheets.structure, subtypesByTicket);
   const statusRolesByTicket = sheets.statusRoles ? xParseStatusAccessRoles(sheets.statusRoles) : {};
   const mandateByTicket = sheets.mandate ? xParseMandateRules(sheets.mandate) : {};
@@ -1313,8 +1372,44 @@ function excelWorkbookToDocs(wb) {
     const subBucketKey = subtypesByTicket[ticketKeyLookup] ? ticketKeyLookup : (subtypesByTicket.__default__ ? "__default__" : ticketKeyLookup);
     const subBucket = subtypesByTicket[subBucketKey] || { subtypes: {}, order: [] };
     // a sub-type's own block (Ticket Subtype column) wins over the ticket type's shared block
-    const rolesFor = (name) => statusRolesByTicket[xScopeKey(ticketKeyLookup, name)] || statusRolesByTicket[ticketKeyLookup] || statusRolesByTicket.__default__ || {};
-    const mandateFor = (name) => mandateByTicket[xScopeKey(ticketKeyLookup, name)] || mandateByTicket[ticketKeyLookup] || mandateByTicket.__default__ || {};
+    const ticketKeyEff = details.ticketKey || details.ticketType || (ticketKeyLookup !== "__default__" ? ticketKeyLookup : "");
+    const ticketCtx = { creators: details.creators || [], viewers: details.viewers || [], ticketAssignee: details.assignee || [] };
+    const effAssignee = (name) => { const st0 = subBucket.subtypes[name]; return st0 && st0.assigneeRoles && st0.assigneeRoles.length ? st0.assigneeRoles : (details.assignee || []); };
+    // a sub-type's own block (Ticket Subtype column) wins over the ticket type's, which wins over the all-ticket-types block
+    // scope rank of the block that applies: 3 = this sub-type's own, 2 = the ticket type's, 1 = the all-ticket-types block
+    const pickScope = (byScope, name) => {
+      const own = byScope[xScopeKey(ticketKeyLookup, name)];
+      if (own && xScopeKey(ticketKeyLookup, name) !== ticketKeyLookup) return { map: own, rank: 3 };
+      if (byScope[ticketKeyLookup]) return { map: byScope[ticketKeyLookup], rank: 2 };
+      if (byScope.__default__) return { map: byScope.__default__, rank: 1 };
+      return { map: {}, rank: 0 };
+    };
+    const rawRolesFor = (name) => pickScope(statusRolesByTicket, name).map;
+    const rawMandateFor = (name) => {
+      const roles = pickScope(statusRolesByTicket, name);
+      const mand = pickScope(mandateByTicket, name);
+      // a broader mandate block must not invent statuses the (narrower) status flow doesn't have
+      if (mand.rank < roles.rank && Object.keys(roles.map).length) {
+        const kept = {};
+        Object.keys(mand.map).forEach((c) => { if (roles.map[c]) kept[c] = mand.map[c]; });
+        return kept;
+      }
+      return mand.map;
+    };
+    const rolesFor = (name) => {
+      const ctx = { ...ticketCtx, assignee: effAssignee(name) };
+      const src = rawRolesFor(name);
+      const out = {};
+      Object.keys(src).forEach((c) => { out[c] = { ...src[c], roles: xResolveRoleTokens(src[c].roles, ctx) }; });
+      return out;
+    };
+    const mandateFor = (name) => {
+      const ctx = { ...ticketCtx, assignee: effAssignee(name) };
+      const src = rawMandateFor(name);
+      const out = {};
+      Object.keys(src).forEach((c) => { out[c] = { ...src[c], newAssigneeRole: src[c].newAssigneeRole ? xResolveRoleTokens(xSplitRoles(src[c].newAssigneeRole), ctx).join(", ") : "" }; });
+      return out;
+    };
     const escalationByStatus = escalationByTicket[ticketKeyLookup] || escalationByTicket.__default__ || {};
     const matrixBucketKey = matrixFieldsByTicket[ticketKeyLookup] ? ticketKeyLookup : (matrixFieldsByTicket.__default__ ? "__default__" : ticketKeyLookup);
     const matrixBySubtype = matrixFieldsByTicket[matrixBucketKey] || {};
@@ -1323,15 +1418,31 @@ function excelWorkbookToDocs(wb) {
     const apiBucketKey = apiFieldsByTicket[ticketKeyLookup] ? ticketKeyLookup : (apiFieldsByTicket.__default__ ? "__default__" : ticketKeyLookup);
     const apiBySubtype = apiFieldsByTicket[apiBucketKey] || {};
 
+    // what the workbook actually said about each sub-type, so a re-upload only
+    // touches the parts it covers (see mergeExcelDoc)
+    const seenList = [];
+    const escTicketHasRows = Object.keys(escalationByStatus).length > 0;
     const ticketSubType = subBucket.order.map((name) => {
       const st = subBucket.subtypes[name];
+      seenList.push({
+        roles: sheets.statusRoles ? new Set(Object.keys(rolesFor(name))) : null,
+        mandate: sheets.mandate ? new Set(Object.keys(mandateFor(name))) : null,
+        esc: sheets.escalation && escTicketHasRows ? new Set(Object.keys(escalationByStatus).filter((c) => escalationByStatus[c] && (escalationByStatus[c][name] || escalationByStatus[c][X_ALL]))) : null,
+        // prefix / assignee the sheet left blank were filled in with defaults: a re-upload must not overwrite a real value with them
+        prefixDefaulted: !st.prefixGiven,
+        assigneeDefaulted: !(st.assigneeRoles && st.assigneeRoles.length),
+      });
+      const subPrefix = st.prefix || details.prefix || xDerivedPrefix(ticketKeyEff);
+      const subAssignee = effAssignee(name);
+      if (!st.prefix && !details.prefix) autoNote.prefix++;
+      if (!(st.assigneeRoles && st.assigneeRoles.length) && subAssignee.length) autoNote.assignee++;
       const matrixFields = (matrixBySubtype[name] || []).map(xMatrixFieldToOutput);
       const cascadeFields = (cascadeBySubtype[name] || []).map(xCascadeFieldToOutput);
       const apiFields = (apiBySubtype[name] || []).map(xApiFieldToOutput);
       const statusWorkFlow = xBuildStatusWorkflow(name, rolesFor(name), mandateFor(name), escalationByStatus);
       return {
-        ticketKey: st.ticketKey, prefix: st.prefix, ticketType: st.ticketType,
-        assignee: (st.assigneeRoles || []).map((r) => ({ roleId: r })),
+        ticketKey: st.ticketKey, prefix: subPrefix, ticketType: st.ticketType,
+        assignee: subAssignee.map((r) => ({ roleId: r })),
         customFieldsMetaData: [...st.customFieldsMetaData.map(xFieldToOutput), ...matrixFields, ...cascadeFields, ...apiFields],
         statusWorkFlow,
         // escalation rules for this sub-type switch auto-escalation on
@@ -1340,8 +1451,8 @@ function excelWorkbookToDocs(wb) {
     });
 
     const rawDoc = {
-      ticketKey: details.ticketKey || (ticketKeyLookup !== "__default__" ? ticketKeyLookup : ""),
-      ticketType: details.ticketType || "",
+      ticketKey: details.ticketKey || details.ticketType || (ticketKeyLookup !== "__default__" ? ticketKeyLookup : ""),
+      ticketType: details.ticketType || details.ticketKey || "",
       tenantId: details.tenantId || "",
       deleted: !!details.deleted,
       creators: (details.creators || []).map((r) => ({ roleId: r })),
@@ -1349,9 +1460,17 @@ function excelWorkbookToDocs(wb) {
       assignee: (details.assignee || []).map((r) => ({ roleId: r })),
       ticketSubType,
     };
-    docs.push(jsonToDoc(rawDoc));
+    const stateDoc = jsonToDoc(rawDoc);
+    stateDoc.ticketSubType.forEach((st, i) => { st._excelSeen = seenList[i]; });
+    docs.push(stateDoc);
   });
 
+  const filled = [
+    autoNote.created ? `${autoNote.created} sub-type(s) created from the "Sub Types" list in Ticket Details` : "",
+    autoNote.prefix ? `prefix filled in for ${autoNote.prefix} sub-type(s)` : "",
+    autoNote.assignee ? `assignee roles filled in from the ticket type for ${autoNote.assignee} sub-type(s)` : "",
+  ].filter(Boolean);
+  if (filled.length) warnings.push(`Auto-filled: ${filled.join(", ")}.`);
   return { docs, warnings, missingSheets };
 }
 
@@ -1403,6 +1522,154 @@ function styleSheet(ws, numCols) {
   });
   const rowCount = ws["!ref"] ? XLSX.utils.decode_range(ws["!ref"]).e.r + 1 : 1;
   ws["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowCount - 1, c: numCols - 1 } }) };
+}
+
+/* The "starter" workbook: a short sheet with FORMULAS wired between its tabs, so only the real
+   information is typed once and the repetitive rows fill themselves in Excel:
+     Ticket Details  (type)  ticket key, roles, optional prefix
+     Sub Types       (type)  ticket key (first row of a group) + sub-type name  ->  key, prefix, assignee, ticket key fill in
+     Default Status Flow (type once)  the status flow every sub-type gets
+     Status Access Roles / Mandate rules  = formulas: every sub-type x every status of the default flow
+   Any generated cell can still be overtyped to make one sub-type different. The result is an ordinary
+   workbook the importer reads (it reads the calculated values), and a minimal sheet also works without formulas. */
+const STARTER_SUBS = 150;      // sub-type rows that are wired up (copy the last row down for more)
+const STARTER_STATUSES = 8;    // statuses the default flow can hold
+function excelStarterWorkbook() {
+  const wb = XLSX.utils.book_new();
+  const TD = "'Ticket Details'", ST = "'Sub Types'", DF = "'Default Status Flow'";
+  const subEnd = STARTER_SUBS + 1, flowEnd = STARTER_STATUSES + 1;
+  const AUTO_FILL = { fill: { fgColor: { rgb: "EAF4EA" } } };
+  const AUTO_HEAD = { ...XLSX_HEADER_STYLE, fill: { fgColor: { rgb: "2E7D5B" } } };
+  const HELPER = { font: { color: { rgb: "9AA5B8" }, sz: 9 } };
+  const F = (f) => ({ t: "s", f, v: "" });
+
+  // ---------------- Start here ----------------
+  const guide = [
+    ["START HERE — type each thing once, the green columns fill themselves in"],
+    [""],
+    ["1. Ticket Details", "One row per ticket type: Ticket Key, roles (comma separated) and, if you want, a Prefix. Leave Prefix blank to get  ${locationId}-<TICKET KEY>."],
+    [""],
+    ["2. Sub Types", "Type the Ticket Key on the first row of each ticket type (it carries down) and one sub-type name per row. Subtype Key, Prefix, Assignee Roles and the carried-down Ticket Key are green: they come from Ticket Details."],
+    ["", "To make one sub-type different, just type over its green cell (its own key, prefix or assignee)."],
+    [""],
+    ["3. Default Status Flow", "Type the status flow ONCE (up to " + STARTER_STATUSES + " statuses). In a role cell you can write <assignee> (the sub-type's assignee), <creators>, <viewers> or <ticket assignee>."],
+    [""],
+    ["4. Status Access Roles / Mandate rules", "Both sheets are formulas: every sub-type gets every status of the Default Status Flow. Nothing to type here. To change ONE sub-type, type over its cells."],
+    [""],
+    ["5. Ticket Structure / Escalation details", "Normal sheets. Leave Ticket Subtype blank (or write (all sub-types)) to apply a field or escalation levels to every sub-type of that ticket type."],
+    [""],
+    ["Then", "Save the file and use Import Excel in the app. Open any ticket type to review everything that was filled in."],
+    ["Limits", "Wired for " + STARTER_SUBS + " sub-types and " + STARTER_STATUSES + " statuses. More sub-types: copy the last row of Sub Types down. Keep the Default Status Flow filled from the top with no blank rows between statuses."],
+  ];
+  const wsGuide = XLSX.utils.aoa_to_sheet(guide);
+  wsGuide["!cols"] = [{ wch: 38 }, { wch: 170 }];
+  wsGuide.A1.s = { font: { bold: true, sz: 14, color: { rgb: "1F3864" } } };
+  guide.forEach((row, i) => { const ref = XLSX.utils.encode_cell({ r: i, c: 0 }); if (i > 0 && row[0] && wsGuide[ref]) wsGuide[ref].s = { font: { bold: true } }; });
+  XLSX.utils.book_append_sheet(wb, wsGuide, "Start here");
+
+  // builds a sheet cell by cell so formula cells can carry a style
+  const sheet = (headers, widths, autoCols, rowCount, cellFor, helperCols = []) => {
+    const ws = {};
+    headers.forEach((h, c) => { ws[XLSX.utils.encode_cell({ r: 0, c })] = { t: "s", v: h }; });
+    for (let r = 1; r <= rowCount; r++) {
+      headers.forEach((_, c) => {
+        const f = cellFor(r + 1, c); // 1-based Excel row number
+        if (f == null) return;
+        ws[XLSX.utils.encode_cell({ r, c })] = { ...F(f), s: helperCols.includes(c) ? HELPER : AUTO_FILL };
+      });
+    }
+    ws["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowCount, c: headers.length - 1 } });
+    styleSheet(ws, headers.length);
+    autoCols.forEach((c) => { ws[XLSX.utils.encode_cell({ r: 0, c })].s = AUTO_HEAD; });
+    ws["!cols"] = widths.map((wch) => ({ wch }));
+    return ws;
+  };
+  const plain = (headers, widths) => { const ws = XLSX.utils.aoa_to_sheet([headers]); styleSheet(ws, headers.length); ws["!cols"] = widths.map((wch) => ({ wch })); return ws; };
+
+  // ---------------- Ticket Details (typed) ----------------
+  XLSX.utils.book_append_sheet(wb, plain(["Ticket Key", "Ticket Type", "Tenant", "Creator Roles", "Viewer Roles", "Assignee Roles", "Prefix (optional)", "Delete"], [20, 22, 14, 26, 32, 26, 26, 10]), "Ticket Details");
+
+  // ---------------- Sub Types: type A (first row of a group) + B, the rest is formulas ----------------
+  const tdLookup = (col, key) => `INDEX(${TD}!$${col}:$${col},MATCH(${key},${TD}!$A:$A,0))`;
+  const subFormula = (r, c) => {
+    if (c === 0 || c === 1) return null;                                   // A, B typed
+    if (c === 2) return `IF($B${r}="","",$B${r})`;                       // Subtype Key = name
+    if (c === 3) return `IF($B${r}="","",IF(IFERROR(${tdLookup("G", `$H${r}`)}&"","")<>"",${tdLookup("G", `$H${r}`)},"${"$"}{locationId}-"&UPPER(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE($H${r}," ","-"),"(",""),")",""))))`; // Prefix
+    if (c === 4) return `IF($B${r}="","",IFERROR(${tdLookup("F", `$H${r}`)}&"",""))`;   // Assignee roles from the ticket type
+    if (c === 5 || c === 6) return `IF($B${r}="","","No")`;               // Auto Escalation / Delete
+    if (c === 7) return `IF($B${r}="","",$I${r})`;                       // Ticket Key (auto)
+    if (c === 8) return r === 2 ? `IF($A2<>"",$A2,"")` : `IF($A${r}<>"",$A${r},$I${r - 1})`; // carried-down key (helper)
+    return null;
+  };
+  XLSX.utils.book_append_sheet(wb, sheet(["Ticket Key", "Ticket Subtype", "Subtype Key", "Prefix", "Assignee Roles", "Auto Escalation", "Delete", "Ticket Key (auto)", "(helper)"], [20, 32, 28, 28, 28, 16, 10, 20, 12], [2, 3, 4, 5, 6, 7], STARTER_SUBS, subFormula, [8]), "Sub Types");
+
+  // ---------------- Default Status Flow (typed once) ----------------
+  const flowHeaders = ["Status", "Roles Allowed", "Public", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role"];
+  const flowRows = [
+    ["Open", "", "Yes", "No", "No", "", "", "No", ""],
+    ["In Progress", "<assignee>", "No", "No", "No", "", "", "No", ""],
+    ["Closed", "<assignee>", "No", "No", "Yes", "Closure Remarks", "text", "No", ""],
+    ["Reopen", "<creators>", "No", "No", "Yes", "Reopen Remarks", "text", "No", ""],
+  ];
+  const wsFlow = XLSX.utils.aoa_to_sheet([flowHeaders, ...flowRows]);
+  styleSheet(wsFlow, flowHeaders.length);
+  wsFlow["!cols"] = [26, 30, 10, 18, 18, 26, 16, 20, 26].map((wch) => ({ wch }));
+  wsFlow["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: STARTER_STATUSES, c: flowHeaders.length - 1 } });
+  XLSX.utils.book_append_sheet(wb, wsFlow, "Default Status Flow");
+
+  // ---------------- generated: every sub-type x every status of the default flow ----------------
+  const n = `COUNTA(${DF}!$A$2:$A$${flowEnd})`;
+  const rowsTotal = STARTER_SUBS * STARTER_STATUSES;
+  const flowAt = (col, r) => `INDEX(${DF}!$${col}$2:$${col}$${flowEnd},$H${r})&""`;
+  const resolveTokens = (text, r) => {
+    let t = text;
+    t = `SUBSTITUTE(${t},"<ticket assignee>",IFERROR(${tdLookup("F", `$A${r}`)}&"",""))`;
+    t = `SUBSTITUTE(${t},"<assignee>",INDEX(${ST}!$E$2:$E$${subEnd},$G${r})&"")`;
+    t = `SUBSTITUTE(${t},"<creators>",IFERROR(${tdLookup("D", `$A${r}`)}&"",""))`;
+    t = `SUBSTITUTE(${t},"<viewers>",IFERROR(${tdLookup("E", `$A${r}`)}&"",""))`;
+    return t;
+  };
+  // Status Access Roles: A key | B sub-type | C status | D roles | E public | F (unused spacer) | G sub# | H status#
+  const rolesFormula = (r, c) => {
+    if (c === 6) return `IF(${n}=0,"",IF(INT((ROW()-2)/${n})+1>${STARTER_SUBS},"",IF(INDEX(${ST}!$B$2:$B$${subEnd},INT((ROW()-2)/${n})+1)="","",INT((ROW()-2)/${n})+1)))`;
+    if (c === 7) return `IF($G${r}="","",MOD(ROW()-2,${n})+1)`;
+    const live = `$G${r}<>""`;
+    if (c === 0) return `IF(${live},IF(INDEX(${ST}!$B$2:$B$${subEnd},$G${r})="","",INDEX(${ST}!$H$2:$H$${subEnd},$G${r})),"")`;
+    if (c === 1) return `IF($A${r}="","",INDEX(${ST}!$B$2:$B$${subEnd},$G${r}))`;
+    if (c === 2) return `IF($A${r}="","",INDEX(${DF}!$A$2:$A$${flowEnd},$H${r}))`;
+    if (c === 3) return `IF($A${r}="","",${resolveTokens(flowAt("B", r), r)})`;
+    if (c === 4) return `IF($A${r}="","",${flowAt("C", r)})`;
+    return null;
+  };
+  XLSX.utils.book_append_sheet(wb, sheet(["Ticket Key", "Ticket Subtype", "Status", "Roles Allowed", "Public", "", "Sub #", "Status #"], [20, 32, 22, 34, 10, 3, 8, 9], [0, 1, 2, 3, 4], rowsTotal, rolesFormula, [5, 6, 7]), "Status Access Roles");
+
+  // Mandate rules: A key | B sub-type | C status | D images | E comments | F label | G type | H new assignee | I role | J (spacer) | K sub# | L status#
+  const mandHelpSub = "K", mandHelpSt = "L";
+  const mandFormula = (r, c) => {
+    if (c === 10) return `IF(${n}=0,"",IF(INT((ROW()-2)/${n})+1>${STARTER_SUBS},"",IF(INDEX(${ST}!$B$2:$B$${subEnd},INT((ROW()-2)/${n})+1)="","",INT((ROW()-2)/${n})+1)))`;
+    if (c === 11) return `IF($K${r}="","",MOD(ROW()-2,${n})+1)`;
+    const sub = `$${mandHelpSub}${r}`, st = `$${mandHelpSt}${r}`;
+    const at = (col) => `INDEX(${DF}!$${col}$2:$${col}$${flowEnd},${st})&""`;
+    if (c === 0) return `IF(${sub}<>"",IF(INDEX(${ST}!$B$2:$B$${subEnd},${sub})="","",INDEX(${ST}!$H$2:$H$${subEnd},${sub})),"")`;
+    if (c === 1) return `IF($A${r}="","",INDEX(${ST}!$B$2:$B$${subEnd},${sub}))`;
+    if (c === 2) return `IF($A${r}="","",INDEX(${DF}!$A$2:$A$${flowEnd},${st}))`;
+    if (c >= 3 && c <= 7) return `IF($A${r}="","",${at(String.fromCharCode(65 + c))})`;      // D..H straight from the default flow
+    if (c === 8) {
+      let t = at("I");
+      t = `SUBSTITUTE(${t},"<ticket assignee>",IFERROR(${tdLookup("F", `$A${r}`)}&"",""))`;
+      t = `SUBSTITUTE(${t},"<assignee>",INDEX(${ST}!$E$2:$E$${subEnd},${sub})&"")`;
+      t = `SUBSTITUTE(${t},"<creators>",IFERROR(${tdLookup("D", `$A${r}`)}&"",""))`;
+      t = `SUBSTITUTE(${t},"<viewers>",IFERROR(${tdLookup("E", `$A${r}`)}&"",""))`;
+      return `IF($A${r}="","",${t})`;
+    }
+    return null;
+  };
+  XLSX.utils.book_append_sheet(wb, sheet(["Ticket Key", "Ticket Subtype", "Status", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role", "", "Sub #", "Status #"], [20, 32, 22, 16, 16, 24, 16, 18, 26, 3, 8, 9], [0, 1, 2, 3, 4, 5, 6, 7, 8], rowsTotal, mandFormula, [9, 10, 11]), "Mandate rules for status change");
+
+  // ---------------- normal typed sheets ----------------
+  XLSX.utils.book_append_sheet(wb, plain(["Ticket Key", "Ticket Subtype", "Field (Type)", "Option / Value", "Mandatory", "Edit Roles"], [20, 30, 30, 40, 12, 30]), "Ticket Structure");
+  XLSX.utils.book_append_sheet(wb, plain(["Ticket Key", "Ticket Subtype", "Status", "Level (1 = first)", "Days", "Assignee Role", "Notification (Yes/No)", "Notification Type", "CC Email Addresses", "Override Status"], [20, 30, 18, 14, 8, 22, 14, 18, 40, 18]), "Escalation details");
+  return wb;
 }
 
 function excelWorkbookFromDocs(docs) {
@@ -1549,9 +1816,9 @@ function excelWorkbookFromDocs(docs) {
     });
   };
 
-  const roleRows = [["Ticket Key", "Ticket Subtype", "Status", "Roles Allowed", "Public"]];
+  const roleRows = [["Ticket Key", "Ticket Subtype", "Status", "Roles Allowed", "Public", "Status Code (don't edit)"]];
   list.forEach((doc) => {
-    pushStatusBlocks(roleRows, doc, statusBlocks(doc, (s) => s.statusWorkFlow.map((st) => [st.label || st.status, (st.roles || []).join(", "), st.public ? "Yes" : "No"])));
+    pushStatusBlocks(roleRows, doc, statusBlocks(doc, (s) => s.statusWorkFlow.map((st) => [st.label || st.status, (st.roles || []).join(", "), st.public ? "Yes" : "No", st.status])));
   });
   {
     const ws_ = XLSX.utils.aoa_to_sheet(roleRows);
@@ -1559,7 +1826,7 @@ function excelWorkbookFromDocs(docs) {
     XLSX.utils.book_append_sheet(wb, ws_, "Status Access Roles");
   }
 
-  const mandateRows = [["Ticket Key", "Ticket Subtype", "Status", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role"]];
+  const mandateRows = [["Ticket Key", "Ticket Subtype", "Status", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role", "Status Code (don't edit)"]];
   list.forEach((doc) => {
     pushStatusBlocks(mandateRows, doc, statusBlocks(doc, (s) => s.statusWorkFlow.map((st) => {
       const mand = st.mandatoryCustomFields || [];
@@ -1572,6 +1839,7 @@ function excelWorkbookFromDocs(docs) {
         commentField ? (commentField.type || "text") : "",
         mand.includes("newAssignee") ? "Yes" : "No",
         (st.assigneeRoles || []).join(", "),
+        st.status,
       ];
     })));
   });
@@ -1586,7 +1854,7 @@ function excelWorkbookFromDocs(docs) {
   // carries its own Ticket Key / Sub-type / Status (repeats are greyed) so rows can
   // be sorted, filtered, cut and pasted freely; the Level number sets the order.
   // Ticket types are separated by a blank row and shaded alternately.
-  const ESC_HEADER = ["Ticket Key", "Ticket Subtype", "Status", "Level (1 = first)", "Days", "Assignee Role", "Notification (Yes/No)", "Notification Type", "CC Email Addresses", "Override Status"];
+  const ESC_HEADER = ["Ticket Key", "Ticket Subtype", "Status", "Level (1 = first)", "Days", "Assignee Role", "Notification (Yes/No)", "Notification Type", "CC Email Addresses", "Override Status", "Status Code (don't edit)"];
   const escRows = [ESC_HEADER];
   const escBand = [-1]; // per sheet row: which ticket type it belongs to (-1 = header / spacer)
   const escRepeat = [[]]; // per sheet row: [key, sub-type, status] cells that repeat the row above
@@ -1608,6 +1876,7 @@ function excelWorkbookFromDocs(docs) {
             (e.notificationType || []).join(", "),
             (e.ccAddress || []).join(", "),
             e.overrideStatus || "",
+            st.status,
           ]);
           escBand.push(di);
           escRepeat.push([!firstOfTicket, !firstOfSub, i > 0]);
@@ -1623,7 +1892,7 @@ function excelWorkbookFromDocs(docs) {
   {
     const ws_ = XLSX.utils.aoa_to_sheet(escRows);
     styleSheet(ws_, ESC_HEADER.length);
-    ws_["!cols"] = [26, 26, 16, 14, 8, 22, 14, 18, 40, 18].map((wch) => ({ wch }));
+    ws_["!cols"] = [26, 26, 16, 14, 8, 22, 14, 18, 40, 18, 28].map((wch) => ({ wch }));
     escBand.forEach((band, r) => {
       if (band < 0 || r === 0) return;
       for (let c = 0; c < ESC_HEADER.length; c++) {
@@ -1685,17 +1954,26 @@ function parseBulkEscalationPaste(text, library) {
 }
 
 /* Dry-run / apply in one: returns the new library plus a per-row report.
-   opts: { rows, levels, status, mode: "add"|"replace", sortByDays, extraCc[] }   (new levels get CC emails only from extraCc)
+   opts: { rows, levels, status, mode: "add"|"replace", sortByDays, extraCc[], ccOnReplace: "keep"|"remove" }
    - add: an assignee already on the status only gets its days updated; others are appended
-   - replace: the status's levels are replaced by the ones given
+          (existing levels, with their CC emails, are left alone)
+   - replace: the status's levels are replaced by the ones given. What happens to the
+              CC emails that were on the replaced levels is decided by ccOnReplace:
+                remove -> new levels get only extraCc
+                keep   -> a role that already had a level keeps that level's own CC list;
+                          any other new role gets every CC email that was on the status;
+                          extraCc is added on top (no duplicates)
    - sortByDays: lowest days first (equal days keep their order)
    Roles used by the levels are added to the sub-type and ticket type assignee roles. */
 function bulkEscalationPlan(library, opts) {
   const code = xToStatusCode(opts.status);
   const daysOf = (e) => { const n = parseFloat(e.days); return Number.isFinite(n) ? n : Infinity; };
+  const dedupe = (list) => { const seen = new Set(); return list.filter((m) => { const k = String(m).trim().toLowerCase(); if (!k || seen.has(k)) return false; seen.add(k); return true; }); };
+  const keepCc = opts.mode === "replace" && opts.ccOnReplace === "keep";
+  const oldCc = new Map(); // lower-case email -> email, across every replaced level
   let lib = library;
   const rows = opts.rows.map((row) => {
-    const rep = { id: row.id, subs: 0, added: 0, updated: 0, removed: 0, missing: [], skipped: "" };
+    const rep = { id: row.id, subs: 0, added: 0, updated: 0, removed: 0, ccLevels: 0, missing: [], skipped: "" };
     const desired = [];
     opts.levels.forEach((lv, i) => xSplitRoles(row.roles[i]).forEach((r) => desired.push({ assignee: r, days: String(lv.days).trim() })));
     if (!row.target) { rep.skipped = "pick a ticket type"; return rep; }
@@ -1709,13 +1987,22 @@ function bulkEscalationPlan(library, opts) {
         const w = sub.statusWorkFlow[idx];
         const existing = w.autoEscalationConfig || [];
         let chain = opts.mode === "replace" ? [] : existing.map((e) => ({ ...e }));
-        if (opts.mode === "replace") rep.removed += existing.length;
-        const cc = [...new Set(opts.extraCc || [])];
+        if (opts.mode === "replace") {
+          rep.removed += existing.length;
+          existing.forEach((e) => { if ((e.ccAddress || []).length) { rep.ccLevels++; e.ccAddress.forEach((m) => oldCc.set(String(m).trim().toLowerCase(), String(m).trim())); } });
+        }
+        const allOld = dedupe(existing.flatMap((e) => e.ccAddress || []));
+        const extra = [...new Set(opts.extraCc || [])];
         desired.forEach((dl) => {
           const at = chain.findIndex((e) => xnorm(e.assignee).toLowerCase() === dl.assignee.toLowerCase());
           if (at >= 0) {
             if (String(chain[at].days) !== dl.days) { chain[at] = { ...chain[at], days: dl.days }; rep.updated++; }
           } else {
+            let cc = extra;
+            if (keepCc) {
+              const same = existing.find((e) => xnorm(e.assignee).toLowerCase() === dl.assignee.toLowerCase());
+              cc = dedupe([...(same ? (same.ccAddress || []) : allOld), ...extra]);
+            }
             chain.push({ id: uid(), _id: uuidv4(), assignee: dl.assignee, days: dl.days, overrideStatus: "", notification: true, notificationType: [...NOTIF_TYPES], ccAddress: [...cc] });
             rep.added++;
           }
@@ -1727,8 +2014,10 @@ function bulkEscalationPlan(library, opts) {
     });
     return rep;
   });
-  const totals = rows.reduce((t, r) => ({ subs: t.subs + r.subs, added: t.added + r.added, updated: t.updated + r.updated, removed: t.removed + r.removed }), { subs: 0, added: 0, updated: 0, removed: 0 });
-  return { library: lib, rows, totals };
+  const totals = rows.reduce((t, r) => ({ subs: t.subs + r.subs, added: t.added + r.added, updated: t.updated + r.updated, removed: t.removed + r.removed, ccLevels: t.ccLevels + r.ccLevels }), { subs: 0, added: 0, updated: 0, removed: 0, ccLevels: 0 });
+  // needsCcChoice: replacing levels that carry CC emails and the user hasn't said keep/remove yet
+  const needsCcChoice = opts.mode === "replace" && totals.ccLevels > 0 && !opts.ccOnReplace;
+  return { library: lib, rows, totals, ccEmails: [...oldCc.values()], needsCcChoice };
 }
 
 /* ------------------------------------------------------------------ */
@@ -1833,6 +2122,71 @@ function bulkMandatoryPlan(library, opts) {
   reps.forEach((r) => { totals.types++; ["subs", "statuses", "added", "marked", "removed", "overridden", "conflicts"].forEach((k) => { totals[k] += r[k]; }); });
   totals.unresolved = conflicts.filter((c) => !c.res).length;
   return { library: lib, reps, conflicts, totals, ready: true };
+}
+
+/* ---- Bulk roles: add / remove / replace roles on many ticket types (or sub-types / statuses) at once ----
+   target: "creators" | "viewers" | "assignee" (ticket type assignee roles)
+         | "subAssignee" (assignee roles of the sub-types) | "statusRoles" (roles allowed on a status)
+   action: "add" | "remove" | "replace"
+   o: { target, action, roles[], typeUids (null = every ticket type), excludeSubIds[], statuses[] (blank = all), alsoNotify } */
+const BULK_ROLE_TARGETS = {
+  creators: { label: "Creators", hint: "who can raise the ticket (ticket type)" },
+  viewers: { label: "Viewers", hint: "who can see the ticket (ticket type)" },
+  assignee: { label: "Ticket type assignee roles", hint: "assignee roles on the ticket type itself" },
+  subAssignee: { label: "Sub-type assignee roles", hint: "assignee roles on every sub-type" },
+  statusRoles: { label: "Status access roles", hint: "who can view / move a status" },
+};
+function applyRoleOp(list, action, roles) {
+  const cur = list || [];
+  if (action === "remove") { const next = cur.filter((r) => !roles.includes(r)); return { next, added: 0, removed: cur.length - next.length }; }
+  if (action === "replace") return { next: [...roles], added: roles.filter((r) => !cur.includes(r)).length, removed: cur.filter((r) => !roles.includes(r)).length };
+  const toAdd = roles.filter((r) => !cur.includes(r));
+  return { next: toAdd.length ? [...cur, ...toAdd] : cur, added: toAdd.length, removed: 0 };
+}
+function bulkRolesPlan(library, o) {
+  const roles = [...new Set((o.roles || []).map((r) => xnorm(r)).filter(Boolean))];
+  const codes = (o.statuses || []).map(xToStatusCode).filter(Boolean);
+  const excluded = new Set(o.excludeSubIds || []);
+  const inScope = (d) => !o.typeUids || o.typeUids.includes(d._uid);
+  const problemsOf = (d) => assigneeProblems(d).length + missingRequiredRoles(d).length;
+  const rows = [];
+  const lib = library.map((d) => {
+    if (!inScope(d)) return d;
+    const row = { uid: d._uid, label: d.ticketType || d.ticketKey || "(untitled)", lists: 0, added: 0, removed: 0, introduced: 0 };
+    const tally = (r) => { row.lists++; row.added += r.added; row.removed += r.removed; return r.next; };
+    let nd = d;
+    if (!roles.length && o.action !== "replace") { rows.push(row); return d; }
+    if (o.target === "creators" || o.target === "viewers" || o.target === "assignee") {
+      const field = o.target;
+      nd = { ...d, [field]: tally(applyRoleOp(d[field], o.action, roles)) };
+    } else if (o.target === "subAssignee") {
+      nd = { ...d, ticketSubType: d.ticketSubType.map((sub) => (excluded.has(sub.id) ? sub : { ...sub, assigneeRoles: tally(applyRoleOp(sub.assigneeRoles, o.action, roles)) })) };
+    } else if (o.target === "statusRoles") {
+      nd = {
+        ...d,
+        ticketSubType: d.ticketSubType.map((sub) => {
+          if (excluded.has(sub.id)) return sub;
+          return {
+            ...sub,
+            statusWorkFlow: sub.statusWorkFlow.map((w) => {
+              if (codes.length && !codes.includes(xToStatusCode(w.status)) && !codes.includes(xToStatusCode(w.label))) return w;
+              const r = applyRoleOp(w.roles, o.action, roles);
+              tally(r);
+              const out = { ...w, roles: r.next };
+              if (o.alsoNotify) out.notificationRole = applyRoleOp(w.notificationRole, o.action, roles).next;
+              return out;
+            }),
+          };
+        }),
+      };
+    }
+    if (row.added + row.removed === 0) nd = d; // nothing really changed: keep the very same object
+    row.introduced = Math.max(0, problemsOf(nd) - problemsOf(d));
+    rows.push(row);
+    return nd;
+  });
+  const totals = rows.reduce((t, r) => ({ types: t.types + (r.added + r.removed ? 1 : 0), lists: t.lists + r.lists, added: t.added + r.added, removed: t.removed + r.removed, introduced: t.introduced + r.introduced }), { types: 0, lists: 0, added: 0, removed: 0, introduced: 0 });
+  return { library: lib, rows, totals };
 }
 
 function templateFromRawJson(raw, name) {
@@ -4088,22 +4442,66 @@ function LibraryTab({ library, selectedUid, onSelectType, onSelectSubtype, onNew
 /* Bulk escalation                                                     */
 /* ------------------------------------------------------------------ */
 
+function StepTitle({ n, title, hint }) {
+  return (
+    <div className="mb-2 flex items-start gap-2.5">
+      <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-indigo-500 text-[11px] font-bold text-white">{n}</span>
+      <div>
+        <p className="text-sm font-semibold text-white">{title}</p>
+        {hint && <p className="text-xs text-white/70">{hint}</p>}
+      </div>
+    </div>
+  );
+}
+
+/* Big selectable option (radio behaviour) with a one-line explanation */
+function ChoiceCard({ selected, onClick, title, desc, tone }) {
+  const ring = selected ? (tone === "danger" ? "border-rose-400 bg-rose-500/10" : "border-indigo-400 bg-indigo-500/10") : "border-white/10 hover:border-white/30";
+  return (
+    <button type="button" onClick={onClick} className={`flex w-full items-start gap-3 rounded-xl border p-3 text-left ${ring}`}>
+      <span className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border ${selected ? "border-white bg-white" : "border-white/40"}`}>
+        {selected && <span className={`h-2 w-2 rounded-full ${tone === "danger" ? "bg-rose-500" : "bg-indigo-500"}`} />}
+      </span>
+      <span>
+        <span className="block text-sm font-medium text-white">{title}</span>
+        <span className="block text-xs text-white/70">{desc}</span>
+      </span>
+    </button>
+  );
+}
+
 function BulkEscalationTab({ library, onApply }) {
-  const [status, setStatus] = useState("open");
+  const [status, setStatus] = useState("");
   const [mode, setMode] = useState("add");
+  const [ccOnReplace, setCcOnReplace] = useState(""); // "" (not chosen yet) | keep | remove
   const [sortByDays, setSortByDays] = useState(true);
   const [extraCcText, setExtraCcText] = useState("");
   const [levels, setLevels] = useState([{ days: "0" }, { days: "3" }]);
-  const [rows, setRows] = useState([]);
+  const [rows, setRows] = useState(() => [{ id: uid(), target: "", label: "", roles: ["", ""] }]);
   const [pasted, setPasted] = useState(false);
+  const [showPaste, setShowPaste] = useState(false);
 
   const cellInput = "w-full rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-1.5 text-sm text-white placeholder:text-slate-600 outline-none focus:border-indigo-400";
   const extraCc = extraCcText.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean);
   const plan = useMemo(
-    () => bulkEscalationPlan(library, { rows, levels, status, mode, sortByDays, extraCc }),
-    [library, rows, levels, status, mode, sortByDays, extraCcText], // eslint-disable-line react-hooks/exhaustive-deps
+    () => bulkEscalationPlan(library, { rows, levels, status, mode, sortByDays, extraCc, ccOnReplace }),
+    [library, rows, levels, status, mode, sortByDays, extraCcText, ccOnReplace], // eslint-disable-line react-hooks/exhaustive-deps
   );
   const changes = plan.totals.added + plan.totals.updated + plan.totals.removed;
+
+  // statuses that exist in the library (click to fill the box) and role names already used (autocomplete)
+  const foundStatuses = useMemo(() => {
+    const map = new Map();
+    library.forEach((d) => d.ticketSubType.forEach((sub) => sub.statusWorkFlow.forEach((w) => {
+      const c = xToStatusCode(w.status || w.label);
+      if (!c) return;
+      const cur = map.get(c) || { code: c, label: w.label || w.status, count: 0 };
+      cur.count++;
+      map.set(c, cur);
+    })));
+    return [...map.values()].sort((a, b) => b.count - a.count).slice(0, 14);
+  }, [library]);
+  const knownRoles = useMemo(() => [...new Set(library.flatMap((d) => d.assignee || []))].sort(), [library]);
 
   const setRow = (id, patch) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
   const setRole = (id, i, v) => setRows((rs) => rs.map((r) => (r.id === id ? { ...r, roles: r.roles.map((x, j) => (j === i ? v : x)) } : r)));
@@ -4128,128 +4526,198 @@ function BulkEscalationTab({ library, onApply }) {
     setPasted(true);
   };
   const apply = () => {
+    if (!status.trim()) { window.alert("Step 1: type the status you want to update (for example: open)."); return; }
+    if (plan.needsCcChoice) { window.alert("Step 2: the levels being replaced have CC emails.\n\nChoose whether to remove those CC emails or keep them on the new levels."); return; }
     if (!changes) return;
-    const where = plan.totals.subs;
-    const parts = [plan.totals.added ? `add ${plan.totals.added} level${plan.totals.added === 1 ? "" : "s"}` : "", plan.totals.updated ? `update days on ${plan.totals.updated}` : "", plan.totals.removed ? `remove ${plan.totals.removed} existing level${plan.totals.removed === 1 ? "" : "s"}` : ""].filter(Boolean);
-    if (!window.confirm(`On the "${status}" status of ${where} sub-type${where === 1 ? "" : "s"}: ${parts.join(", ")}.\n\nContinue?`)) return;
-    onApply(plan.library, plan.totals);
+    const t = plan.totals;
+    const where = t.subs;
+    const parts = [t.added ? `add ${t.added} level${t.added === 1 ? "" : "s"}` : "", t.updated ? `update days on ${t.updated}` : "", t.removed ? `remove ${t.removed} existing level${t.removed === 1 ? "" : "s"}` : ""].filter(Boolean);
+    const ccLine = mode === "replace" && t.ccLevels > 0 ? `\n\nCC emails on the replaced levels will be ${ccOnReplace === "keep" ? "KEPT (copied onto the new levels)" : "REMOVED"}.` : "";
+    if (!window.confirm(`On the "${status}" status of ${where} sub-type${where === 1 ? "" : "s"}: ${parts.join(", ")}.${ccLine}\n\nContinue?`)) return;
+    onApply(plan.library, { ...plan.totals, ccKept: mode === "replace" && ccOnReplace === "keep" });
   };
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       <div className="rounded-xl border border-white/10 bg-[#0D1220] p-4 text-sm text-white">
-        <p className="font-medium mb-1">Add the same escalation levels to every sub-type, in one step</p>
+        <p className="mb-1 font-medium">Set up auto-escalation for many sub-types at once</p>
         <p className="text-xs text-white/70">
-          Each row is a ticket type; each level column is the assignee role for that level and the days after which it escalates.
-          Paste a table straight from Excel (ticket type in the first column, one assignee column per level), or fill the grid by hand.
-          Use <span className="font-mono">All ticket types</span> in a row to apply the same roles everywhere.
+          Answer the four steps below. Nothing is changed until you press <span className="font-semibold">Apply</span> at the bottom, and the table shows exactly what will happen first.
         </p>
-        <textarea
-          onPaste={onPaste}
-          rows={2}
-          placeholder="Click here and paste the table from Excel (Ctrl+V) — header cells like “Assignee 2 after 72 hours” set that level's days automatically"
-          className="mt-3 w-full rounded-lg border border-dashed border-white/20 bg-[#0B0F1C] px-3 py-2 text-xs text-white placeholder:text-slate-500 outline-none focus:border-indigo-400"
-        />
-        {pasted && <p className="mt-1 text-xs text-emerald-300">Table loaded — check the matches below, then apply.</p>}
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-        <div>
-          <Label hint="Status code or label">Status to update</Label>
-          <Input mono value={status} onChange={setStatus} placeholder="open" />
-        </div>
-        <div>
-          <Label>If a level already exists</Label>
-          <select value={mode} onChange={(e) => setMode(e.target.value)} className={cellInput}>
-            <option value="add">Keep existing, add the new ones</option>
-            <option value="replace">Replace all levels on that status</option>
-          </select>
-        </div>
-        <div className="md:col-span-2">
-          <Label hint="Only the new levels get these (comma separated). Leave empty for no CC.">CC emails (optional)</Label>
-          <Input value={extraCcText} onChange={setExtraCcText} placeholder="ops@company.com" />
-        </div>
-      </div>
-      <div className="flex flex-wrap gap-x-6 gap-y-2 text-sm text-white">
-        <label className="flex cursor-pointer items-center gap-2"><Checkbox checked={sortByDays} onChange={setSortByDays} />Order levels by days (lowest first; equal days keep their order)</label>
+      {/* 1 — status */}
+      <div>
+        <StepTitle n={1} title="Which status should get the escalation?" hint="Every sub-type of the ticket types you pick in step 3 is updated on this one status." />
+        <div className="md:w-1/2"><Input mono value={status} onChange={setStatus} placeholder="e.g. open" /></div>
+        {foundStatuses.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <span className="text-xs text-white/60">Statuses in your data — click one:</span>
+            {foundStatuses.map((st) => (
+              <button
+                key={st.code} type="button" onClick={() => setStatus(st.code)}
+                className={`rounded-full border px-2.5 py-0.5 text-xs ${xToStatusCode(status) === st.code ? "border-indigo-400 bg-indigo-500/20 text-indigo-100" : "border-white/10 text-white/80 hover:border-white/30"}`}
+              >{st.label || st.code} <span className="text-white/50">· {st.count}</span></button>
+            ))}
+          </div>
+        )}
       </div>
 
-      <div className="overflow-x-auto rounded-xl border border-white/10 bg-[#111528]">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-left text-[11px] uppercase tracking-wider text-white">
-              <th className="px-3 py-2.5 min-w-[210px]">Ticket type</th>
-              {levels.map((lv, i) => (
-                <th key={i} className="px-3 py-2.5 min-w-[190px]">
-                  <div className="flex items-center gap-2">
-                    <span>Level {i + 1}</span>
-                    <span className="font-normal normal-case text-white/70">days</span>
-                    <input
-                      value={lv.days}
-                      onChange={(e) => setLevels((ls) => ls.map((x, j) => (j === i ? { days: e.target.value.replace(/[^0-9.]/g, "") } : x)))}
-                      className="w-14 rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-1 text-sm text-white outline-none focus:border-indigo-400"
-                    />
-                    {levels.length > 1 && <IconBtn danger title="Remove this level column" onClick={() => removeLevel(i)}><X size={13} /></IconBtn>}
-                  </div>
-                </th>
-              ))}
-              <th className="px-3 py-2.5"><button type="button" onClick={addLevel} className="text-xs font-medium normal-case text-indigo-300 hover:text-indigo-200 inline-flex items-center gap-1"><Plus size={13} />Level</button></th>
-              <th className="px-3 py-2.5 min-w-[200px]">Result</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 && (
-              <tr><td colSpan={levels.length + 4} className="px-3 py-8 text-center text-xs text-white/70">Paste a table above, or add a row.</td></tr>
+      {/* 2 — existing levels */}
+      <div>
+        <StepTitle n={2} title="What if that status already has escalation levels?" />
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <ChoiceCard
+            selected={mode === "add"} onClick={() => setMode("add")}
+            title="Keep them and add mine"
+            desc="Existing levels (and their CC emails) stay as they are. If one of your roles is already there, only its days are updated."
+          />
+          <ChoiceCard
+            selected={mode === "replace"} onClick={() => setMode("replace")} tone="danger"
+            title="Replace them with mine"
+            desc="Existing levels on that status are deleted. Only the levels you enter below remain."
+          />
+        </div>
+
+        {mode === "replace" && (
+          <div className={`mt-3 rounded-xl border p-4 ${plan.needsCcChoice ? "border-amber-500/40 bg-amber-500/10" : "border-white/10 bg-[#111528]"}`}>
+            <p className="text-sm font-medium text-white">What should happen to the CC emails on the levels being replaced?</p>
+            {plan.totals.ccLevels === 0 ? (
+              <p className="mt-1 text-xs text-white/70">None of the levels being replaced have CC emails, so there is nothing to decide here.</p>
+            ) : (
+              <>
+                <p className="mt-1 text-xs text-white/70">
+                  {plan.totals.ccLevels} level{plan.totals.ccLevels === 1 ? "" : "s"} being replaced {plan.totals.ccLevels === 1 ? "has" : "have"} CC emails
+                  {plan.ccEmails.length ? <>: <span className="font-mono text-white/90">{plan.ccEmails.slice(0, 4).join(", ")}{plan.ccEmails.length > 4 ? ` +${plan.ccEmails.length - 4} more` : ""}</span></> : ""}.
+                </p>
+                <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+                  <ChoiceCard
+                    selected={ccOnReplace === "remove"} onClick={() => setCcOnReplace("remove")}
+                    title="Remove them"
+                    desc="The new levels start with no CC emails (apart from the ones you type in step 4)."
+                  />
+                  <ChoiceCard
+                    selected={ccOnReplace === "keep"} onClick={() => setCcOnReplace("keep")}
+                    title="Keep them"
+                    desc="Copy the old CC emails onto the new levels. A role that already had a level keeps that level's own CC list; new roles get all of the old CC emails."
+                  />
+                </div>
+                {plan.needsCcChoice && <p className="mt-2 text-xs font-medium text-amber-200">Please choose one — Apply is disabled until you do.</p>}
+              </>
             )}
-            {rows.map((r, ri) => {
-              const rep = plan.rows[ri] || {};
-              return (
-                <tr key={r.id} className="border-t border-white/5 align-top">
-                  <td className="px-3 py-2">
-                    <select
-                      value={r.target}
-                      onChange={(e) => setRow(r.id, { target: e.target.value })}
-                      className={`${cellInput} ${r.target ? "" : "ring-1 ring-rose-500/60"}`}
-                    >
-                      <option value="">{r.label ? `“${r.label}” — pick a ticket type` : "Pick a ticket type…"}</option>
-                      <option value="*">All ticket types</option>
-                      {library.map((d) => <option key={d._uid} value={d._uid}>{d.ticketType || d.ticketKey}</option>)}
-                    </select>
-                  </td>
-                  {levels.map((_, i) => (
-                    <td key={i} className="px-3 py-2"><input value={r.roles[i] || ""} onChange={(e) => setRole(r.id, i, e.target.value)} placeholder="role (comma for several)" className={`${cellInput} font-mono`} /></td>
-                  ))}
-                  <td />
-                  <td className="px-3 py-2 text-xs leading-5">
-                    {rep.skipped ? (
-                      <span className="text-amber-300">Skipped — {rep.skipped}</span>
-                    ) : (
-                      <>
-                        <span className="text-white">{rep.subs} sub-type{rep.subs === 1 ? "" : "s"}</span>
-                        <span className="text-emerald-300"> · +{rep.added}</span>
-                        {rep.updated > 0 && <span className="text-sky-300"> · {rep.updated} days updated</span>}
-                        {rep.removed > 0 && <span className="text-rose-300"> · −{rep.removed} replaced</span>}
-                        {rep.missing.length > 0 && <div className="text-amber-300" title={rep.missing.join("\n")}>{rep.missing.length} sub-type{rep.missing.length === 1 ? "" : "s"} have no “{status}” status</div>}
-                      </>
-                    )}
-                  </td>
-                  <td className="px-2 py-2"><IconBtn danger title="Remove row" onClick={() => setRows((rs) => rs.filter((x) => x.id !== r.id))}><Trash2 size={14} /></IconBtn></td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+          </div>
+        )}
       </div>
 
-      <div className="flex flex-wrap items-center gap-3">
-        <Btn variant="dashed" onClick={addRow}><Plus size={15} />Add row</Btn>
-        <div className="ml-auto flex items-center gap-3">
-          <span className="text-sm text-white">
-            {changes ? `${plan.totals.added} to add · ${plan.totals.updated} to update · ${plan.totals.removed} to remove, across ${plan.totals.subs} sub-types` : "Nothing to change yet"}
-          </span>
-          <Btn variant="accent" onClick={apply}><Check size={15} />Apply to all sub-types</Btn>
+      {/* 3 — who and when */}
+      <div>
+        <div className="flex items-start justify-between gap-3">
+          <StepTitle n={3} title="Who should it escalate to, and after how many days?" hint="One row per ticket type. For each level, type the assignee role and set the number of days in the column title." />
+          <button type="button" onClick={() => setShowPaste((v) => !v)} className="shrink-0 text-xs font-medium text-indigo-300 hover:text-indigo-200">
+            {showPaste ? "Hide Excel paste" : "Have it in Excel? Paste it"}
+          </button>
         </div>
+        {showPaste && (
+          <div className="mb-3 rounded-xl border border-white/10 bg-[#0D1220] p-3">
+            <p className="text-xs text-white/70">Copy the table in Excel — ticket type in the first column, one role column per level — click the box and press Ctrl+V. A header like “Assignee 2 after 72 hours” sets that level's days.</p>
+            <textarea
+              onPaste={onPaste} rows={2} placeholder="Click here, then Ctrl+V"
+              className="mt-2 w-full rounded-lg border border-dashed border-white/20 bg-[#0B0F1C] px-3 py-2 text-xs text-white placeholder:text-slate-500 outline-none focus:border-indigo-400"
+            />
+            {pasted && <p className="mt-1 text-xs text-emerald-300">Table loaded — check the rows below.</p>}
+          </div>
+        )}
+        <datalist id="bulk-esc-roles">{knownRoles.map((r) => <option key={r} value={r} />)}</datalist>
+        <div className="overflow-x-auto rounded-xl border border-white/10 bg-[#111528]">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-[11px] uppercase tracking-wider text-white">
+                <th className="px-3 py-2.5 min-w-[210px]">Ticket type</th>
+                {levels.map((lv, i) => (
+                  <th key={i} className="px-3 py-2.5 min-w-[200px]">
+                    <div className="flex items-center gap-2">
+                      <span>Level {i + 1}</span>
+                      <span className="font-normal normal-case text-white/70">after</span>
+                      <input
+                        value={lv.days}
+                        onChange={(e) => setLevels((ls) => ls.map((x, j) => (j === i ? { days: e.target.value.replace(/[^0-9.]/g, "") } : x)))}
+                        className="w-14 rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-1 text-center text-sm text-white outline-none focus:border-indigo-400"
+                        title="Days after which this level is notified (0 = straight away)"
+                      />
+                      <span className="font-normal normal-case text-white/70">days</span>
+                      {levels.length > 1 && <IconBtn danger title="Remove this level" onClick={() => removeLevel(i)}><X size={13} /></IconBtn>}
+                    </div>
+                  </th>
+                ))}
+                <th className="px-3 py-2.5"><button type="button" onClick={addLevel} className="inline-flex items-center gap-1 text-xs font-medium normal-case text-indigo-300 hover:text-indigo-200"><Plus size={13} />Add level</button></th>
+                <th className="px-3 py-2.5 min-w-[200px]">What will happen</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, ri) => {
+                const rep = plan.rows[ri] || {};
+                return (
+                  <tr key={r.id} className="border-t border-white/5 align-top">
+                    <td className="px-3 py-2">
+                      <select value={r.target} onChange={(e) => setRow(r.id, { target: e.target.value })} className={`${cellInput} ${r.target ? "" : "ring-1 ring-rose-500/60"}`}>
+                        <option value="">{r.label ? `“${r.label}” — pick a ticket type` : "Pick a ticket type…"}</option>
+                        <option value="*">All ticket types</option>
+                        {library.map((d) => <option key={d._uid} value={d._uid}>{d.ticketType || d.ticketKey}</option>)}
+                      </select>
+                    </td>
+                    {levels.map((_, i) => (
+                      <td key={i} className="px-3 py-2">
+                        <input list="bulk-esc-roles" value={r.roles[i] || ""} onChange={(e) => setRole(r.id, i, e.target.value)} placeholder="Role, e.g. Manager" className={`${cellInput} font-mono`} />
+                      </td>
+                    ))}
+                    <td />
+                    <td className="px-3 py-2 text-xs leading-5">
+                      {rep.skipped ? (
+                        <span className="text-amber-300">Not applied yet — {rep.skipped}</span>
+                      ) : (
+                        <>
+                          <span className="text-white">{rep.subs} sub-type{rep.subs === 1 ? "" : "s"}</span>
+                          <span className="text-emerald-300"> · +{rep.added} added</span>
+                          {rep.updated > 0 && <span className="text-sky-300"> · {rep.updated} days updated</span>}
+                          {rep.removed > 0 && <span className="text-rose-300"> · −{rep.removed} replaced</span>}
+                          {rep.missing.length > 0 && <div className="text-amber-300" title={rep.missing.join("\n")}>{rep.missing.length} sub-type{rep.missing.length === 1 ? "" : "s"} skipped: no “{status || "…"}” status</div>}
+                        </>
+                      )}
+                    </td>
+                    <td className="px-2 py-2">{rows.length > 1 && <IconBtn danger title="Remove this row" onClick={() => setRows((rs) => rs.filter((x) => x.id !== r.id))}><Trash2 size={14} /></IconBtn>}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-2"><Btn variant="dashed" small onClick={addRow}><Plus size={13} />Add another ticket type</Btn></div>
+        <p className="mt-2 text-xs text-white/70">Tip: choose “All ticket types” in a row to use the same roles everywhere. Put several roles in one box by separating them with commas.</p>
+      </div>
+
+      {/* 4 — options */}
+      <div>
+        <StepTitle n={4} title="Optional extras" />
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <div>
+            <Label hint="Added to the NEW levels only. Separate several with commas. Leave empty for none.">CC emails for the new levels</Label>
+            <Input value={extraCcText} onChange={setExtraCcText} placeholder="ops@company.com, lead@company.com" />
+          </div>
+          <label className="flex cursor-pointer items-start gap-2 pt-1 text-sm text-white">
+            <Checkbox checked={sortByDays} onChange={setSortByDays} title="Sort levels by days" />
+            <span>Sort the levels by days<span className="block text-xs text-white/70">Lowest days first, so the order always matches the timing.</span></span>
+          </label>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3 border-t border-white/10 pt-4">
+        <span className="text-sm text-white">
+          {plan.needsCcChoice
+            ? "Choose what to do with the CC emails (step 2) to continue"
+            : changes ? `${plan.totals.added} to add · ${plan.totals.updated} to update · ${plan.totals.removed} to remove, across ${plan.totals.subs} sub-types` : "Nothing to change yet — fill in the steps above"}
+        </span>
+        <div className="ml-auto"><Btn variant="accent" onClick={apply}><Check size={15} />Apply to all sub-types</Btn></div>
       </div>
       <p className="text-xs text-white/70">The roles you enter are also added to each sub-type's and ticket type's assignee roles, which the export check requires. Sub-types stay switched on for auto-escalation.</p>
     </div>
@@ -4530,6 +4998,182 @@ function BulkMandatoryTab({ library, onApply }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Bulk roles                                                          */
+/* ------------------------------------------------------------------ */
+
+function BulkRolesTab({ library, onApply }) {
+  const [target, setTarget] = useState("creators");
+  const [action, setAction] = useState("add");
+  const [roles, setRoles] = useState([]);
+  const [allTypes, setAllTypes] = useState(true);
+  const [picked, setPicked] = useState([]);
+  const [excludeSubIds, setExcludeSubIds] = useState([]);
+  const [expanded, setExpanded] = useState([]);
+  const [statusText, setStatusText] = useState("");
+  const [alsoNotify, setAlsoNotify] = useState(true);
+
+  const subLevel = target === "subAssignee" || target === "statusRoles";
+  const statuses = statusText.split(/[,;\n]+/).map((x) => x.trim()).filter(Boolean);
+  const typeUids = allTypes ? null : picked;
+
+  const plan = useMemo(
+    () => bulkRolesPlan(library, { target, action, roles, typeUids, excludeSubIds, statuses, alsoNotify }),
+    [library, target, action, roles, allTypes, picked, excludeSubIds, statusText, alsoNotify], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const T = plan.totals;
+  const changes = T.added + T.removed;
+  const rowOf = (uidVal) => plan.rows.find((r) => r.uid === uidVal);
+
+  // roles already used on this field somewhere (click to add)
+  const existing = useMemo(() => {
+    const m = new Map();
+    const bump = (r) => m.set(r, (m.get(r) || 0) + 1);
+    library.forEach((d) => {
+      if (target === "creators") (d.creators || []).forEach(bump);
+      else if (target === "viewers") (d.viewers || []).forEach(bump);
+      else if (target === "assignee") (d.assignee || []).forEach(bump);
+      else if (target === "subAssignee") d.ticketSubType.forEach((sub) => (sub.assigneeRoles || []).forEach(bump));
+      else d.ticketSubType.forEach((sub) => sub.statusWorkFlow.forEach((w) => (w.roles || []).forEach(bump)));
+    });
+    return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 24);
+  }, [library, target]);
+
+  const togglePicked = (id, on) => setPicked((p) => (on ? [...p, id] : p.filter((x) => x !== id)));
+  const toggleSub = (id, on) => setExcludeSubIds((e) => (on ? e.filter((x) => x !== id) : [...e, id]));
+  const toggleExpanded = (id) => setExpanded((e) => (e.includes(id) ? e.filter((x) => x !== id) : [...e, id]));
+  const scopeCount = allTypes ? library.length : picked.length;
+  const verb = action === "add" ? "add" : action === "remove" ? "remove" : "replace with";
+
+  const apply = () => {
+    if (!changes) return;
+    const what = BULK_ROLE_TARGETS[target].label.toLowerCase();
+    const msg = action === "replace"
+      ? `Replace the ${what} on ${T.types} ticket type${T.types === 1 ? "" : "s"} with: ${roles.join(", ") || "(nothing)"}.`
+      : `${action === "add" ? "Add" : "Remove"} ${roles.join(", ")} ${action === "add" ? "to" : "from"} the ${what} of ${T.types} ticket type${T.types === 1 ? "" : "s"}.`;
+    const warn = T.introduced ? `\n\n⚠ ${T.introduced} ticket type${T.introduced === 1 ? "" : "s"} will then be blocked at export (e.g. no creators / viewers, or an escalation role missing).` : "";
+    if (!window.confirm(msg + warn + "\n\nContinue?")) return;
+    onApply(plan.library, T, { target, action, roles });
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="rounded-xl border border-white/10 bg-[#0D1220] p-4 text-sm text-white">
+        <p className="font-medium mb-1">Add, remove or replace roles on many ticket types at once</p>
+        <p className="text-xs text-white/70">Pick what to change, the roles, and which ticket types — instead of opening every ticket type and sub-type by hand. You see exactly what changes before anything is applied.</p>
+      </div>
+
+      <div>
+        <StepTitle n={1} title="What should change?" />
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+          {Object.entries(BULK_ROLE_TARGETS).map(([id, t]) => (
+            <ChoiceCard key={id} selected={target === id} onClick={() => setTarget(id)} title={t.label} desc={t.hint} />
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <StepTitle n={2} title="What to do with the roles?" />
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+          <ChoiceCard selected={action === "add"} onClick={() => setAction("add")} title="Add" desc="Keep what is there, add these roles (skips ones already present)" />
+          <ChoiceCard selected={action === "remove"} onClick={() => setAction("remove")} tone="danger" title="Remove" desc="Take these roles out, leave the rest" />
+          <ChoiceCard selected={action === "replace"} onClick={() => setAction("replace")} tone="danger" title="Replace all" desc="Throw away the current list and use only these roles" />
+        </div>
+      </div>
+
+      <div>
+        <StepTitle n={3} title="Which roles?" hint="Type a role id and press Enter or comma" />
+        <TagInput values={roles} onChange={setRoles} placeholder="corpadmin" tone="indigo" />
+        {existing.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <span className="text-xs text-white/60">Already used here:</span>
+            {existing.map(([r, n]) => (
+              <button key={r} type="button" onClick={() => !roles.includes(r) && setRoles([...roles, r])}
+                className={`rounded-full border px-2.5 py-0.5 text-xs ${roles.includes(r) ? "border-indigo-400 bg-indigo-500/20 text-indigo-100" : "border-white/10 text-white/80 hover:border-white/30"}`}>
+                {r} <span className="text-white/50">· {n}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        {target === "statusRoles" && (
+          <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2">
+            <div>
+              <Label hint="Blank = every status. Status code or label, comma separated">Only these statuses (optional)</Label>
+              <Input mono value={statusText} onChange={setStatusText} placeholder="inprogress, closed" />
+            </div>
+            <label className="flex cursor-pointer items-center gap-2 self-end pb-2 text-sm text-white">
+              <Checkbox checked={alsoNotify} onChange={setAlsoNotify} title="Also change the notification roles" />Also notify these roles (notification roles)
+            </label>
+          </div>
+        )}
+      </div>
+
+      <div>
+        <StepTitle n={4} title="Which ticket types?" hint={subLevel ? "Open a ticket type to leave out individual sub-types" : undefined} />
+        <div className="rounded-xl border border-white/10 bg-[#111528] p-3">
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-white">
+            <Checkbox checked={allTypes} onChange={setAllTypes} title="Every ticket type" />All ticket types ({library.length})
+          </label>
+        </div>
+        <div className="mt-2 divide-y divide-white/5 rounded-xl border border-white/10 bg-[#111528]">
+          {library.length === 0 && <p className="p-3 text-xs text-white/70">No ticket types loaded yet.</p>}
+          {library.map((d) => {
+            const on = allTypes || picked.includes(d._uid);
+            const r = rowOf(d._uid);
+            const open = expanded.includes(d._uid);
+            return (
+              <div key={d._uid}>
+                <div className="flex items-center gap-3 px-3 py-2">
+                  <Checkbox checked={on} disabled={allTypes} onChange={(v) => togglePicked(d._uid, v)} title="Include this ticket type" />
+                  {subLevel && (
+                    <button type="button" onClick={() => toggleExpanded(d._uid)} className="text-white/70 hover:text-white">
+                      {open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                    </button>
+                  )}
+                  <span className="min-w-0 flex-1 truncate text-sm text-white">{d.ticketType || d.ticketKey || "(untitled)"}<span className="ml-2 text-xs text-white/50">{d.ticketSubType.length} sub-types</span></span>
+                  {on && r && (
+                    <span className="text-xs">
+                      {r.added + r.removed === 0 ? <span className="text-white/50">no change</span> : (
+                        <>
+                          {r.added > 0 && <span className="text-emerald-300">+{r.added}</span>}
+                          {r.removed > 0 && <span className="ml-1.5 text-rose-300">−{r.removed}</span>}
+                          <span className="ml-1.5 text-white/50">{subLevel ? `in ${r.lists} place${r.lists === 1 ? "" : "s"}` : ""}</span>
+                        </>
+                      )}
+                      {r.introduced > 0 && <span className="ml-2 text-amber-300">⚠ export blocked</span>}
+                    </span>
+                  )}
+                </div>
+                {subLevel && open && (
+                  <div className="grid grid-cols-1 gap-x-4 gap-y-1 border-t border-white/5 bg-[#0D1220] px-10 py-2 md:grid-cols-2">
+                    {d.ticketSubType.map((sub) => (
+                      <label key={sub.id} className="flex cursor-pointer items-center gap-2 text-xs text-white">
+                        <Checkbox checked={!excludeSubIds.includes(sub.id)} onChange={(v) => toggleSub(sub.id, v)} title="Include this sub-type" />
+                        <span className="truncate">{sub.ticketType || sub.ticketKey}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-sm text-white">
+          {!roles.length && action !== "replace" ? "Enter at least one role" : changes
+            ? `${T.added} to add · ${T.removed} to remove, on ${T.types} of ${scopeCount} ticket type${scopeCount === 1 ? "" : "s"}`
+            : "Nothing to change (the roles are already in place, or no ticket type is selected)"}
+        </span>
+        {T.introduced > 0 && <span className="text-sm text-amber-300">⚠ {T.introduced} ticket type{T.introduced === 1 ? "" : "s"} would be blocked at export (e.g. left without creators/viewers)</span>}
+        <div className="ml-auto"><Btn variant={action === "add" ? "accent" : "danger"} onClick={apply}><Check size={15} />{action === "add" ? "Add roles" : action === "remove" ? "Remove roles" : "Replace roles"}</Btn></div>
+      </div>
+      <p className="text-xs text-white/70">A role only needs to be {verb === "add" ? "added" : "listed"} once per place; roles that are already there are skipped. Nothing else on the ticket types is touched.</p>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* App                                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -4579,6 +5223,8 @@ function mergeIncomingDoc(current, incoming) {
   const { result, added, updated } = upsertSubtypes(current.ticketSubType, incoming.ticketSubType);
   return {
     doc: {
+      // keep the document's own extras (its Mongo _id above all), or a re-import would silently drop them
+      _passthrough: { ...(incoming._passthrough || {}), ...(current._passthrough || {}) },
       ticketKey: current.ticketKey || incoming.ticketKey,
       ticketType: current.ticketType || incoming.ticketType,
       tenantId: current.tenantId || incoming.tenantId,
@@ -4601,29 +5247,230 @@ function extractRawDocs(parsed) {
   return [parsed];
 }
 
+/* ------------------------------------------------------------------ */
+/* Excel re-upload = MERGE, never replace                              */
+/* The workbook only carries part of a ticket type (no notification     */
+/* settings, dependent statuses, status-level remarks / upload / radio  */
+/* fields, field keys, option keys, dependentOn, ids ...). So when a    */
+/* sub-type already exists, only what the sheets actually say is        */
+/* applied and everything else is kept exactly as it was.              */
+/* ------------------------------------------------------------------ */
+const EXCEL_HOLDS_TYPES = ["dropdown", "radio", "multiplechoice", "date", "time", "number", "text", "fileUpload", "matrix", "casecadeDropdown", "apiDropdown"];
+const xSame = (a, b) => xnorm(a).toLowerCase() === xnorm(b).toLowerCase();
+const xSameSet = (a, b) => {
+  const f = (l) => (l || []).map((v) => xnorm(v).toLowerCase()).sort().join("|");
+  return f(a) === f(b);
+};
+
+/* options: the sheet shows values only, so an option that still exists keeps its key and dependentCustomFields */
+function mergeExcelOptions(prevOpts, incOpts) {
+  return (incOpts || []).map((o) => {
+    const prev = (prevOpts || []).find((p) => xSame(p.value, o.value));
+    return prev ? { ...prev, value: o.value } : o;
+  });
+}
+
+/* one sub-type-level field: the sheet owns label / type / mandatory / edit roles / options;
+   key, disabled, displayLabel, dependentOn, hideTotalColumn, formulas ... stay as they were */
+function mergeExcelField(cur, inc) {
+  if (cur.type !== inc.type && !(OPTION_BASED_TYPES.includes(cur.type) && OPTION_BASED_TYPES.includes(inc.type))) {
+    return { ...inc, id: cur.id, key: cur.key || inc.key, disabled: cur.disabled, displayLabel: cur.displayLabel, dependentOn: cur.dependentOn };
+  }
+  const out = { ...cur, label: inc.label, type: inc.type, isMandatory: inc.isMandatory, editRoles: inc.editRoles };
+  if (OPTION_BASED_TYPES.includes(inc.type)) out.options = mergeExcelOptions(cur.options, inc.options);
+  else if (inc.type === "casecadeDropdown") Object.assign(out, { childLabel: inc.childLabel, childKey: inc.childKey, parentOptionType: inc.parentOptionType, options: inc.options });
+  else if (inc.type === "apiDropdown") Object.assign(out, { labelKey: inc.labelKey, valueKey: inc.valueKey, fillOnSelect: inc.fillOnSelect, apiFiltersText: inc.apiFiltersText });
+  else if (inc.type === "matrix") {
+    out.columns = (inc.columns || []).map((c) => {
+      const prev = (cur.columns || []).find((p) => p.key === c.key) || (cur.columns || []).find((p) => xSame(p.label, c.label));
+      return prev ? { ...prev, label: c.label, type: c.type, options: OPTION_BASED_TYPES.includes(c.type) ? mergeExcelOptions(prev.options, c.options) : prev.options } : c;
+    });
+  }
+  return out;
+}
+
+function mergeExcelFieldList(curFields, incFields) {
+  const used = new Set();
+  const out = (incFields || []).map((inc) => {
+    const free = (curFields || []).filter((c) => !used.has(c));
+    const prev = free.find((c) => xSame(c.label, inc.label) && c.type === inc.type) || free.find((c) => xSame(c.label, inc.label)) || free.find((c) => c.key && c.key === inc.key);
+    if (!prev) return inc;
+    used.add(prev);
+    return mergeExcelField(prev, inc);
+  });
+  let kept = 0;
+  // field types the workbook can't hold were never written to it, so they must survive a re-upload
+  (curFields || []).forEach((c, i) => {
+    if (used.has(c) || EXCEL_HOLDS_TYPES.includes(c.type)) return;
+    out.splice(Math.min(i, out.length), 0, c);
+    kept++;
+  });
+  return { fields: out, kept };
+}
+
+/* what the Mandate rules sheet shows for a status */
+function mandateRuleOf(st) {
+  const mand = st.mandatoryCustomFields || [];
+  const field = (st.customFieldsMetaData || []).find((f) => mand.includes(f.key));
+  return { images: mand.includes("images"), newAssignee: mand.includes("newAssignee"), commentOn: !!field || mand.includes("comments"), field, roles: st.assigneeRoles || [] };
+}
+
+/* apply only the DIFFERENCE between the sheet and what the app would have written */
+function applyExcelMandate(cur, inc) {
+  const a = mandateRuleOf(cur), b = mandateRuleOf(inc);
+  let mand = [...(cur.mandatoryCustomFields || [])];
+  let fields = [...(cur.customFieldsMetaData || [])];
+  const setFlag = (key, on) => { mand = mand.filter((k) => k !== key); if (on) mand.push(key); };
+  if (a.images !== b.images) setFlag("images", b.images);
+  if (a.newAssignee !== b.newAssignee) setFlag("newAssignee", b.newAssignee);
+
+  const aLabel = a.field ? a.field.label : "Comments";
+  const aType = a.field ? (a.field.type || "text") : "text";
+  const bField = b.field;
+  const bLabel = bField ? bField.label : "Comments";
+  const bType = bField ? (bField.type || "text") : "text";
+  const simpleType = ["text", "number", "date", "fileUpload"].includes(aType); // the sheet can only express these
+  const typeChanged = simpleType && aType !== bType;
+  if (a.commentOn !== b.commentOn || (b.commentOn && (!xSame(aLabel, bLabel) || typeChanged))) {
+    if (!b.commentOn) {
+      if (a.field) mand = mand.filter((k) => k !== a.field.key);
+      mand = mand.filter((k) => k !== "comments");     // the field itself stays, it just stops being required
+    } else if (a.field) {
+      fields = fields.map((f) => (f === a.field ? { ...f, label: bLabel, ...(typeChanged ? { type: bType } : {}) } : f)); // rename in place, keep its key
+    } else if (bField) {
+      if (!fields.some((f) => f.key === bField.key)) fields.push(bField);
+      if (!mand.includes(bField.key)) mand.push(bField.key);
+    }
+  }
+  const out = { ...cur, mandatoryCustomFields: mand, customFieldsMetaData: fields };
+  if (!xSameSet(cur.assigneeRoles, inc.assigneeRoles)) out.assigneeRoles = inc.assigneeRoles || [];
+  return out;
+}
+
+function mergeExcelStatus(cur, inc, seen) {
+  const code = toStatusCode(cur.status);
+  let out = { ...cur };                                  // notification settings, dependentStatus, remarks/upload/radio fields ... all kept
+  if (seen.roles && seen.roles.has(code)) out = { ...out, label: inc.label, roles: inc.roles, public: inc.public };
+  if (seen.mandate && seen.mandate.has(code)) out = applyExcelMandate(out, inc);
+  if (seen.esc) {
+    if (!seen.esc.has(code)) out = { ...out, autoEscalationConfig: [] };            // the sheet lists every level, so a status with none left has none
+    else {
+      const used = new Set();
+      out.autoEscalationConfig = (inc.autoEscalationConfig || []).map((lv) => {
+        const prev = (cur.autoEscalationConfig || []).find((p) => !used.has(p) && xSame(p.assignee, lv.assignee));
+        if (!prev) return lv;
+        used.add(prev);                                                              // keeps the level's _id
+        return { ...prev, assignee: lv.assignee, days: lv.days, notification: lv.notification, notificationType: lv.notificationType, ccAddress: lv.ccAddress, overrideStatus: lv.overrideStatus };
+      });
+    }
+  }
+  return out;
+}
+
+function mergeExcelSubType(cur, inc, seen) {
+  const notes = [];
+  const curStatuses = cur.statusWorkFlow || [];
+  const byCode = new Map(curStatuses.map((s) => [toStatusCode(s.status), s]));
+  const used = new Set();
+  const ambiguous = [];
+  const statuses = (inc.statusWorkFlow || []).map((is) => {
+    const code = toStatusCode(is.status);
+    const c = byCode.get(code);
+    if (!c) {
+      // a workbook exported before the "Status Code" column existed only has labels: a row whose label
+      // belongs to an existing status (e.g. several "Approve" / "Reject") can't be told apart, so it is skipped
+      // rather than added as a made-up extra status
+      if (curStatuses.some((x) => xSame(x.label, is.label))) { ambiguous.push(is.label); return null; }
+      return is;
+    }
+    if (used.has(code)) return null;
+    used.add(code);
+    return mergeExcelStatus(c, is, seen);
+  }).filter(Boolean);
+  if (ambiguous.length) notes.push(`${ambiguous.length} row(s) share a label with existing statuses (${[...new Set(ambiguous)].join(", ")}) and have no Status Code, so they were ignored. Export a fresh workbook to get the Status Code column.`);
+  const left = curStatuses.filter((s) => !used.has(toStatusCode(s.status)));
+  curStatuses.forEach((s, i) => { if (left.includes(s)) statuses.splice(Math.min(i, statuses.length), 0, s); });
+  if (left.length) notes.push(`${left.length} status(es) in the app aren't in the sheet — kept as they were (${left.map((s) => s.label || s.status).join(", ")})`);
+  const { fields, kept } = mergeExcelFieldList(cur.customFieldsMetaData, inc.customFieldsMetaData);
+  if (kept) notes.push(`${kept} field(s) of a type Excel can't hold were kept`);
+  return {
+    sub: {
+      ...cur,
+      ticketType: inc.ticketType || cur.ticketType,
+      prefix: seen.prefixDefaulted ? (cur.prefix || inc.prefix) : (inc.prefix || cur.prefix),
+      assigneeRoles: !seen.assigneeDefaulted && (inc.assigneeRoles || []).length ? inc.assigneeRoles : (cur.assigneeRoles && cur.assigneeRoles.length ? cur.assigneeRoles : (inc.assigneeRoles || [])),
+      deleted: inc.deleted,
+      isAutoEscalation: inc.isAutoEscalation,
+      customFieldsMetaData: fields,
+      statusWorkFlow: statuses,
+    },
+    notes,
+  };
+}
+
+function mergeExcelDoc(current, incoming) {
+  const strip = (s) => { const { _excelSeen, ...rest } = s; return rest; };
+  if (isDocEmpty(current)) {
+    return { doc: { ...incoming, ticketSubType: incoming.ticketSubType.map(strip) }, added: incoming.ticketSubType.map((s) => s.ticketType || s.ticketKey), updated: [], notes: [] };
+  }
+  const list = [...current.ticketSubType];
+  const added = [], updated = [], notes = [];
+  incoming.ticketSubType.forEach((inc) => {
+    const key = xnorm(inc.ticketKey).toLowerCase();
+    const idx = key ? list.findIndex((s) => xnorm(s.ticketKey).toLowerCase() === key) : -1;
+    const label = inc.ticketType || inc.ticketKey || "(unnamed)";
+    if (idx >= 0) {
+      const r = mergeExcelSubType(list[idx], strip(inc), inc._excelSeen || {});
+      list[idx] = r.sub;
+      updated.push(label);
+      r.notes.forEach((n) => notes.push(`${current.ticketType || current.ticketKey} › ${label}: ${n}`));
+    } else {
+      list.push(strip(inc));
+      added.push(label);
+    }
+  });
+  return {
+    doc: {
+      ...current,
+      ticketKey: current.ticketKey || incoming.ticketKey,
+      ticketType: current.ticketType || incoming.ticketType,
+      tenantId: current.tenantId || incoming.tenantId,
+      creators: current.creators.length ? current.creators : incoming.creators,
+      viewers: current.viewers.length ? current.viewers : incoming.viewers,
+      assignee: current.assignee.length ? current.assignee : incoming.assignee,
+      ticketSubType: list,
+    },
+    added, updated, notes,
+  };
+}
+
 /* Upsert a whole batch of incoming ticket types into the library, matched
    by ticketKey (case-insensitive). New ticket types are appended; existing
    ones get their sub-types merged via mergeIncomingDoc (never wiped). */
-function importDocsIntoLibrary(library, incomingDocs) {
+function importDocsIntoLibrary(library, incomingDocs, opts = {}) {
   let nextLibrary = [...library];
   const newTypes = [];
   const updatedTypes = [];
+  const mergeNotes = [];
   incomingDocs.forEach((inc) => {
     const incKey = xnorm(inc.ticketKey).toLowerCase();
     const idx = incKey ? nextLibrary.findIndex((d) => xnorm(d.ticketKey).toLowerCase() === incKey) : -1;
     if (idx >= 0) {
-      const { doc: merged, added, updated } = mergeIncomingDoc(nextLibrary[idx], inc);
+      const r = opts.excel ? mergeExcelDoc(nextLibrary[idx], inc) : mergeIncomingDoc(nextLibrary[idx], inc);
+      const { doc: merged, added, updated } = r;
+      if (r.notes) mergeNotes.push(...r.notes);
       nextLibrary[idx] = { ...merged, _uid: nextLibrary[idx]._uid };
       const label = inc.ticketType || inc.ticketKey || "(unnamed)";
       if (added.length || updated.length) {
         updatedTypes.push(`${label} (+${added.length} sub-type${added.length === 1 ? "" : "s"} added, ${updated.length} updated)`);
       }
     } else {
-      nextLibrary.push({ ...inc, _uid: uid() });
+      const fresh = opts.excel ? { ...inc, ticketSubType: inc.ticketSubType.map(({ _excelSeen, ...rest }) => rest), _passthrough: { _id: newOid(), ...(inc._passthrough || {}) } } : inc;
+      nextLibrary.push({ ...fresh, _uid: uid() });
       newTypes.push(inc.ticketType || inc.ticketKey || "(unnamed)");
     }
   });
-  return { library: nextLibrary, newTypes, updatedTypes };
+  return { library: nextLibrary, newTypes, updatedTypes, mergeNotes };
 }
 
 export default function App({ initialData } = {}) {
@@ -4762,10 +5609,12 @@ export default function App({ initialData } = {}) {
         const { docs: rawParsedDocs, warnings, missingSheets } = excelWorkbookToDocs(wb);
         const prefixFixes = [];
         const parsedDocs = rawParsedDocs.map((d) => { const r = normalizeDocPrefixes(d); prefixFixes.push(...r.fixes); return r.doc; });
-        const { library: nextLibrary, newTypes, updatedTypes } = importDocsIntoLibrary(library, parsedDocs);
+        const { library: nextLibrary, newTypes, updatedTypes, mergeNotes } = importDocsIntoLibrary(library, parsedDocs, { excel: true });
         setLibrary(nextLibrary);
         notifyPrefixFixes(prefixFixes);
         const notes = [...warnings];
+        if (updatedTypes.length) notes.push("Existing ticket types were merged, not replaced: anything the workbook doesn't carry (notification settings, dependent statuses, status remarks / upload / radio fields, field and option keys, ids) was kept as it was.");
+        notes.push(...(mergeNotes || []));
         if (newTypes.length) notes.push(`New ticket type(s): ${newTypes.join(", ")}`);
         if (updatedTypes.length) notes.push(...updatedTypes.map((t) => `Updated: ${t}`));
         setImportNotice((notes.length || missingSheets.length) ? { title: `Excel imported (${parsedDocs.length} ticket type${parsedDocs.length === 1 ? "" : "s"})`, warnings: notes, missingSheets } : null);
@@ -4777,6 +5626,11 @@ export default function App({ initialData } = {}) {
     };
     reader.readAsArrayBuffer(file);
     e.target.value = "";
+  };
+
+  const downloadStarterSheet = () => {
+    XLSX.writeFile(excelStarterWorkbook(), "ticket-types-starter.xlsx", { compression: true });
+    showToast({ type: "info", title: "Starter sheet downloaded", lines: ["Type the ticket types, then one sub-type per row. The green columns (keys, prefixes, assignees, status flow for every sub-type) fill themselves in Excel — then import the saved file."] });
   };
 
   const exportSelectedToExcel = () => {
@@ -5082,7 +5936,7 @@ export default function App({ initialData } = {}) {
     showToast({
       type: "success",
       title: "Escalation levels applied",
-      lines: [`${totals.added} added, ${totals.updated} days updated${totals.removed ? `, ${totals.removed} replaced` : ""} across ${totals.subs} sub-types. Assignee roles were added where needed.`],
+      lines: [`${totals.added} added, ${totals.updated} days updated${totals.removed ? `, ${totals.removed} replaced` : ""} across ${totals.subs} sub-types.${totals.removed && totals.ccLevels ? (totals.ccKept ? " Old CC emails were kept on the new levels." : " Old CC emails were removed.") : ""} Assignee roles were added where needed.`],
     });
   };
 
@@ -5097,12 +5951,23 @@ export default function App({ initialData } = {}) {
     });
   };
 
+  const applyBulkRoles = (nextLibrary, totals, info) => {
+    setLibrary(nextLibrary);
+    const what = BULK_ROLE_TARGETS[info.target].label.toLowerCase();
+    showToast({
+      type: "success",
+      title: info.action === "add" ? "Roles added" : info.action === "remove" ? "Roles removed" : "Roles replaced",
+      lines: [`${what}: ${totals.added} added, ${totals.removed} removed across ${totals.types} ticket type${totals.types === 1 ? "" : "s"}.`],
+    });
+  };
+
   const nav = [
     { id: "library", label: `Ticket Types (${library.length})`, icon: <ListTree size={16} /> },
     { id: "templates", label: `Templates (${templates.length})`, icon: <LayoutTemplate size={16} /> },
     { id: "smartupdate", label: "Smart Update", icon: <Wand2 size={16} /> },
     { id: "bulkesc", label: "Bulk Escalation", icon: <AlertTriangle size={16} /> },
     { id: "bulkmand", label: "Bulk Mandatory", icon: <ShieldCheck size={16} /> },
+    { id: "bulkroles", label: "Bulk Roles", icon: <Users size={16} /> },
     { id: "details", label: "Details", icon: <Ticket size={16} /> },
     { id: "roles", label: "Roles", icon: <Users size={16} /> },
     { id: "subtypes", label: `Sub-Types (${selected ? selected.ticketSubType.length : 0})`, icon: <ListTree size={16} /> },
@@ -5132,7 +5997,7 @@ export default function App({ initialData } = {}) {
         </div>
         <nav className="flex-1 px-2 py-4 space-y-1">
           {nav.map((n) => {
-            const disabled = n.id !== "library" && n.id !== "templates" && n.id !== "smartupdate" && n.id !== "bulkesc" && n.id !== "bulkmand" && !selected;
+            const disabled = n.id !== "library" && n.id !== "templates" && n.id !== "smartupdate" && n.id !== "bulkesc" && n.id !== "bulkmand" && n.id !== "bulkroles" && !selected;
             return (
               <button
                 key={n.id}
@@ -5147,6 +6012,9 @@ export default function App({ initialData } = {}) {
           })}
         </nav>
         <div className="px-3 py-4 border-t border-white/5 space-y-1.5">
+          <button onClick={downloadStarterSheet} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-white hover:bg-white/5 hover:text-white transition" title="An Excel sheet with formulas: type ticket types + sub-type names once, keys / prefixes / assignees / status flow fill in by themselves">
+            <FileSpreadsheet size={13} /> Download starter sheet
+          </button>
           <button onClick={loadSample} className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs text-white hover:bg-white/5 hover:text-white transition">
             <RefreshCw size={13} /> Add sample ticket type
           </button>
@@ -5158,10 +6026,10 @@ export default function App({ initialData } = {}) {
         <header className="bg-[#0A0E1C] border-b border-white/10 px-8 py-4 flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-base font-semibold text-white truncate">
-              {tab === "library" ? "All ticket types" : tab === "templates" ? "Sub-type templates" : tab === "smartupdate" ? "Smart update" : tab === "bulkesc" ? "Bulk escalation" : tab === "bulkmand" ? "Bulk mandatory fields" : (selected ? (selected.ticketType || "Untitled ticket type") : "No ticket type selected")}
+              {tab === "library" ? "All ticket types" : tab === "templates" ? "Sub-type templates" : tab === "smartupdate" ? "Smart update" : tab === "bulkesc" ? "Bulk escalation" : tab === "bulkmand" ? "Bulk mandatory fields" : tab === "bulkroles" ? "Bulk roles" : (selected ? (selected.ticketType || "Untitled ticket type") : "No ticket type selected")}
             </h1>
             <p className="text-xs font-mono text-white">
-              {tab === "library" ? `${library.length} loaded` : tab === "templates" ? `${templates.length} template${templates.length === 1 ? "" : "s"} available for bulk creation` : tab === "smartupdate" ? "describe changes, review the diff, then apply" : tab === "bulkesc" ? "bulk-add escalation levels" : tab === "bulkmand" ? "require fields when a status is reached" : (selected ? (selected.ticketKey || "no key set yet") : "pick one from Ticket Types")}
+              {tab === "library" ? `${library.length} loaded` : tab === "templates" ? `${templates.length} template${templates.length === 1 ? "" : "s"} available for bulk creation` : tab === "smartupdate" ? "describe changes, review the diff, then apply" : tab === "bulkesc" ? "bulk-add escalation levels" : tab === "bulkmand" ? "require fields when a status is reached" : tab === "bulkroles" ? "roles in bulk" : (selected ? (selected.ticketKey || "no key set yet") : "pick one from Ticket Types")}
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -5206,7 +6074,7 @@ export default function App({ initialData } = {}) {
           </div>
         )}
 
-        <div className={(tab === "library" || tab === "templates" || tab === "smartupdate" || tab === "bulkesc" || tab === "bulkmand") ? "px-8 py-6" : "px-8 py-6 max-w-4xl"}>
+        <div className={(tab === "library" || tab === "templates" || tab === "smartupdate" || tab === "bulkesc" || tab === "bulkmand" || tab === "bulkroles") ? "px-8 py-6" : "px-8 py-6 max-w-4xl"}>
           {tab === "library" && (
             <LibraryTab
               library={library}
@@ -5241,6 +6109,7 @@ export default function App({ initialData } = {}) {
           )}
           {tab === "bulkesc" && <BulkEscalationTab library={library} onApply={applyBulkEscalation} />}
           {tab === "bulkmand" && <BulkMandatoryTab library={library} onApply={applyBulkMandatory} />}
+          {tab === "bulkroles" && <BulkRolesTab library={library} onApply={applyBulkRoles} />}
           {tab === "details" && selected && <DetailsTab doc={selected} onChange={updateSelected} />}
           {tab === "roles" && selected && <RolesTab doc={selected} onChange={updateSelected} />}
           {tab === "subtypes" && selected && (
