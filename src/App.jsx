@@ -582,7 +582,7 @@ const xFindCol = (header, needle) => header.findIndex((h) => h.includes(needle))
    Sub-types     <- the "Sub Types" list in Ticket Details (one comma separated cell)
    Status flow   <- one block with a blank Ticket Key / Ticket Subtype serves every sub-type
    Role cells accept <assignee> <creators> <viewers> <ticket assignee> instead of typing role ids. */
-const xDerivedPrefix = (ticketKey) => "${locationId}-" + xnorm(ticketKey).toUpperCase().replace(/[^A-Z0-9&]+/g, "-").replace(/^-+|-+$/g, "");
+const xDerivedPrefix = (ticketKey) => "${locationId}-" + xnorm(ticketKey).replace(/[^A-Za-z0-9&]+/g, "-").replace(/^-+|-+$/g, "");
 const xSplitList = (v) => xnorm(v).split(/[,;\n]+/).map((x) => x.trim()).filter(Boolean);
 const X_ALL = "*";
 const xIsAllLabel = (v) => /^\(?\s*all(\s+sub-?\s?types?)?\s*\)?$/i.test(xnorm(v));
@@ -610,10 +610,11 @@ function xParseTicketDetails(sheet) {
   if (rows.length < 2) return [];
   const header = rows[0].map((h) => xnorm(h).toLowerCase());
   const col = (n) => xFindCol(header, n);
+  let lastTenant = ""; // Tenant carries down: only the first row needs it
   return rows.slice(1).map((r) => ({
     ticketKey: xnorm(xCell(r, col("ticket key"))),
     ticketType: xnorm(xCell(r, col("ticket type"))),
-    tenantId: xnorm(xCell(r, col("tenant"))),
+    tenantId: (lastTenant = xnorm(xCell(r, col("tenant"))) || lastTenant),
     creators: xSplitRoles(xCell(r, col("creator"))),
     viewers: xSplitRoles(xCell(r, col("viewer"))),
     assignee: xSplitRoles(xCell(r, col("assignee"))),
@@ -909,7 +910,7 @@ function xParseEscalationDetailsLegacy(sheet) {
    shuffle the assignees just change the Level numbers. Notification
    defaults to Yes, in-app + email when those cells are empty. */
 function xNotifTypes(cell) {
-  const wanted = xnorm(cell).split(/[,;/\n]+/).map((t) => t.toLowerCase().replace(/[^a-z]/g, "")).filter(Boolean);
+  const wanted = xnorm(cell).split(/[,;/&+\n]+|\s+and\s+/i).map((t) => t.toLowerCase().replace(/[^a-z]/g, "")).filter(Boolean);
   const out = [];
   wanted.forEach((w) => {
     const hit = NOTIF_TYPES.find((n) => n.toLowerCase() === w) || (w === "app" || w === "inapp" ? "inApp" : null);
@@ -1432,7 +1433,7 @@ function excelWorkbookToDocs(wb) {
         prefixDefaulted: !st.prefixGiven,
         assigneeDefaulted: !(st.assigneeRoles && st.assigneeRoles.length),
       });
-      const subPrefix = st.prefix || details.prefix || xDerivedPrefix(ticketKeyEff);
+      const subPrefix = renderPrefix(st.prefix || details.prefix || xDerivedPrefix(ticketKeyEff), { ticketType: details.ticketType || ticketKeyEff, ticketKey: ticketKeyEff }, { ticketType: name });
       const subAssignee = effAssignee(name);
       if (!st.prefix && !details.prefix) autoNote.prefix++;
       if (!(st.assigneeRoles && st.assigneeRoles.length) && subAssignee.length) autoNote.assignee++;
@@ -1524,152 +1525,398 @@ function styleSheet(ws, numCols) {
   ws["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowCount - 1, c: numCols - 1 } }) };
 }
 
-/* The "starter" workbook: a short sheet with FORMULAS wired between its tabs, so only the real
-   information is typed once and the repetitive rows fill themselves in Excel:
-     Ticket Details  (type)  ticket key, roles, optional prefix
-     Sub Types       (type)  ticket key (first row of a group) + sub-type name  ->  key, prefix, assignee, ticket key fill in
+/* ====================================================================================
+   The "starter" workbook — the shortest possible sheet to fill in.
+   Formulas wire the tabs together, dropdowns pick instead of type, helper columns are hidden:
+     Roles               (type once)  every role id used anywhere  -> feeds the dropdowns
+     Ticket Details      (type)       ticket key, roles, optional prefix. Tenant carries down.
+     Sub Types           (type)       ticket key (pick from list) + sub-type name  ->  key, prefix, assignee fill in
      Default Status Flow (type once)  the status flow every sub-type gets
      Status Access Roles / Mandate rules  = formulas: every sub-type x every status of the default flow
-   Any generated cell can still be overtyped to make one sub-type different. The result is an ordinary
-   workbook the importer reads (it reads the calculated values), and a minimal sheet also works without formulas. */
-const STARTER_SUBS = 150;      // sub-type rows that are wired up (copy the last row down for more)
-const STARTER_STATUSES = 8;    // statuses the default flow can hold
+     Ticket Structure / Escalation details  normal sheets, with dropdowns
+   Colours: blue header = you type, green = fills itself, slate = optional. Any green cell can be
+   overtyped for one exceptional sub-type. The importer reads the calculated values, and a minimal
+   sheet without formulas still works.
+   ==================================================================================== */
+const STARTER = { tickets: 50, subs: 150, statuses: 8, roles: 100, fieldRows: 300, escRows: 300 };
+const SX = { navy: "1F3864", green: "2E7D5B", slate: "5B6B8C", amber: "B7791F", line: "C5CEDB", autoBg: "EAF4EA", autoInk: "1E3A2F", paper: "F5F7FB" };
+const SX_BORDER = { top: { style: "thin", color: { rgb: SX.line } }, bottom: { style: "thin", color: { rgb: SX.line } }, left: { style: "thin", color: { rgb: SX.line } }, right: { style: "thin", color: { rgb: SX.line } } };
+const sxHead = (bg) => ({ font: { bold: true, color: { rgb: "FFFFFF" }, sz: 11 }, fill: { fgColor: { rgb: bg } }, alignment: { horizontal: "center", vertical: "center", wrapText: true }, border: SX_BORDER });
+const SX_INPUT = { border: SX_BORDER, alignment: { vertical: "center" }, font: { sz: 11 } };
+const SX_AUTO = { border: SX_BORDER, fill: { fgColor: { rgb: SX.autoBg } }, alignment: { vertical: "center" }, font: { sz: 11, color: { rgb: SX.autoInk } } };
+// conditional-format styles (index = dxfId)
+const SX_DXFS = [
+  '<dxf><font><b/><color rgb="FF9C0006"/></font><fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf>',   // 0 problem (red)
+  '<dxf><font><color rgb="FF7F6000"/></font><fill><patternFill><bgColor rgb="FFFFEB9C"/></patternFill></fill></dxf>',        // 1 missing (amber)
+  '<dxf><fill><patternFill><bgColor rgb="FFDCEBDD"/></patternFill></fill></dxf>',                                          // 2 band (darker green)
+  '<dxf><border><top style="thin"><color rgb="FF2E7D5B"/></top></border></dxf>',                                          // 3 block start
+];
+const SX_TOKENS = ["<assignee>", "<creators>", "<viewers>", "<ticket assignee>"];
+
+/* one sheet: typed / auto / optional / helper columns, a bordered grid of N body rows, formulas where cellFor says so */
+function sxSheet({ headers, kinds, widths, rows, cellFor, freezeCols = 0, tab, hidden = [], validations = [], conditional = [], headHeight = 34 }) {
+  const ws = {};
+  const headBg = { type: SX.navy, auto: SX.green, optional: SX.slate, helper: "9AA5B8" };
+  headers.forEach((h, c) => { ws[XLSX.utils.encode_cell({ r: 0, c })] = { t: "s", v: h, s: sxHead(headBg[kinds[c]] || SX.navy) }; });
+  for (let r = 2; r <= rows + 1; r++) {
+    headers.forEach((_, c) => {
+      const kind = kinds[c];
+      const cf = cellFor ? cellFor(r, c) : undefined;
+      const style = kind === "auto" || kind === "helper" ? SX_AUTO : SX_INPUT;
+      const ref = XLSX.utils.encode_cell({ r: r - 1, c });
+      if (typeof cf === "string") ws[ref] = { t: "s", f: cf, v: "", s: style };
+      else if (cf && cf.v !== undefined) ws[ref] = { t: "s", v: cf.v, s: style };
+      else ws[ref] = { t: "s", v: "", s: style }; // styled blank (turned into a truly empty <c/> when the file is written)
+    });
+  }
+  ws["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows, c: headers.length - 1 } });
+  ws["!cols"] = widths.map((wch, i) => ({ wch, hidden: hidden.includes(i) }));
+  ws["!rows"] = [{ hpt: headHeight }];
+  ws["!autofilter"] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows, c: headers.length - 1 } }) };
+  return { ws, meta: { tab, freeze: { rows: 1, cols: freezeCols }, noGrid: true, validations, conditional } };
+}
+
+const sxListRange = (sheet, col, firstRow, lastRow) => `OFFSET('${sheet}'!$${col}$${firstRow},0,0,MAX(1,COUNTIF('${sheet}'!$${col}$${firstRow}:$${col}$${lastRow},"?*")),1)`;
+const sxYesNo = (sqref, title) => ({ sqref, formula1: '"Yes,No"', errorStyle: "warning", prompt: title ? [title, "Pick Yes or No"] : null });
+
 function excelStarterWorkbook() {
   const wb = XLSX.utils.book_new();
+  const meta = {};
+  const { tickets: NT, subs: NS, statuses: NF, roles: NR, fieldRows: NFR, escRows: NER } = STARTER;
   const TD = "'Ticket Details'", ST = "'Sub Types'", DF = "'Default Status Flow'";
-  const subEnd = STARTER_SUBS + 1, flowEnd = STARTER_STATUSES + 1;
-  const AUTO_FILL = { fill: { fgColor: { rgb: "EAF4EA" } } };
-  const AUTO_HEAD = { ...XLSX_HEADER_STYLE, fill: { fgColor: { rgb: "2E7D5B" } } };
-  const HELPER = { font: { color: { rgb: "9AA5B8" }, sz: 9 } };
-  const F = (f) => ({ t: "s", f, v: "" });
+  const subEnd = NS + 1, flowEnd = NF + 1;
+  // Lists / ranges are DEFINED NAMES: dropdowns and conditional formats that point at another sheet must go through a name to stay valid in Excel.
+  const NAMES = [
+    ["lstKeys", sxListRange("Ticket Details", "A", 2, NT + 1)],
+    ["lstSubs", sxListRange("Sub Types", "B", 2, subEnd)],
+    ["lstStatus", sxListRange("Default Status Flow", "A", 2, flowEnd)],
+    ["lstRoles", sxListRange("Roles", "A", 2, NR + 1)],
+    ["lstRoleTokens", `OFFSET(Roles!$C$2,0,0,${SX_TOKENS.length}+COUNTIF(Roles!$A$2:$A$${NR + 1},"?*"),1)`],
+    ["rngKeys", `${TD}!$A$2:$A$${NT + 1}`],
+  ];
+  const keysList = "lstKeys", subsList = "lstSubs", statusList = "lstStatus", rolesList = "lstRoles", rolesTokenList = "lstRoleTokens";
+  const keyMissing = (cell) => `AND(${cell}<>"",COUNTIF(rngKeys,${cell})=0)`;
 
   // ---------------- Start here ----------------
-  const guide = [
-    ["START HERE — type each thing once, the green columns fill themselves in"],
-    [""],
-    ["1. Ticket Details", "One row per ticket type: Ticket Key, roles (comma separated) and, if you want, a Prefix. Leave Prefix blank to get  ${locationId}-<TICKET KEY>."],
-    [""],
-    ["2. Sub Types", "Type the Ticket Key on the first row of each ticket type (it carries down) and one sub-type name per row. Subtype Key, Prefix, Assignee Roles and the carried-down Ticket Key are green: they come from Ticket Details."],
-    ["", "To make one sub-type different, just type over its green cell (its own key, prefix or assignee)."],
-    [""],
-    ["3. Default Status Flow", "Type the status flow ONCE (up to " + STARTER_STATUSES + " statuses). In a role cell you can write <assignee> (the sub-type's assignee), <creators>, <viewers> or <ticket assignee>."],
-    [""],
-    ["4. Status Access Roles / Mandate rules", "Both sheets are formulas: every sub-type gets every status of the Default Status Flow. Nothing to type here. To change ONE sub-type, type over its cells."],
-    [""],
-    ["5. Ticket Structure / Escalation details", "Normal sheets. Leave Ticket Subtype blank (or write (all sub-types)) to apply a field or escalation levels to every sub-type of that ticket type."],
-    [""],
-    ["Then", "Save the file and use Import Excel in the app. Open any ticket type to review everything that was filled in."],
-    ["Limits", "Wired for " + STARTER_SUBS + " sub-types and " + STARTER_STATUSES + " statuses. More sub-types: copy the last row of Sub Types down. Keep the Default Status Flow filled from the top with no blank rows between statuses."],
-  ];
-  const wsGuide = XLSX.utils.aoa_to_sheet(guide);
-  wsGuide["!cols"] = [{ wch: 38 }, { wch: 170 }];
-  wsGuide.A1.s = { font: { bold: true, sz: 14, color: { rgb: "1F3864" } } };
-  guide.forEach((row, i) => { const ref = XLSX.utils.encode_cell({ r: i, c: 0 }); if (i > 0 && row[0] && wsGuide[ref]) wsGuide[ref].s = { font: { bold: true } }; });
-  XLSX.utils.book_append_sheet(wb, wsGuide, "Start here");
-
-  // builds a sheet cell by cell so formula cells can carry a style
-  const sheet = (headers, widths, autoCols, rowCount, cellFor, helperCols = []) => {
+  {
+    const steps = [
+      ["1", "Roles  (type once)", "List every role id used in this workbook, one per row. They then appear in dropdowns everywhere you need a role. You can still type any other role directly."],
+      ["2", "Ticket Details", "One row per ticket type. Type the Ticket Key and the creator / viewer / assignee roles (comma separated, or pick one from the dropdown). Ticket Type defaults to the key, Tenant carries down from the row above. Amber cells = still empty."],
+      ["3", "Sub Types", "Pick the Ticket Key from the dropdown on the first row of each ticket type (it carries down) and type one sub-type name per row. The green cells — Subtype Key, Prefix, Assignee Roles — fill themselves. Type over a green cell only for an exception."],
+      ["4", "Default Status Flow  (type once)", "The status flow every sub-type gets: statuses, who can use them, whether comments / images are mandatory. In a role cell use <assignee>, <creators>, <viewers> or <ticket assignee> instead of typing role ids."],
+      ["5", "Status Access Roles / Mandate rules", "Nothing to type: both sheets are generated — every sub-type x every status of the Default Status Flow. Banded by sub-type. To change ONE sub-type, type over its cells."],
+      ["6", "Ticket Structure / Escalation details", "Normal sheets with dropdowns. Leave Ticket Subtype blank (or write (all sub-types)) to apply a field or escalation levels to every sub-type of that ticket type."],
+      ["7", "Save, then Import Excel in the app", "Open any ticket type in the app to review what was filled in. If a red or amber cell is left, fix it first."],
+    ];
+    const tips = [
+      ["Prefix", "Leave the Prefix cell empty and each sub-type gets  ${locationId}-<ticket key>  (letter case kept). Or type a pattern in Ticket Details → Prefix with {ticketKey}  {ticketType}  {subType}  (capitals = UPPER CASE), e.g.  ${locationId}-{ticketType}"],
+      ["Colours", "Blue header = you type.  Green = fills itself.  Slate = optional.  Red cell = a problem (unknown ticket key, duplicate key).  Amber = a required value is missing."],
+      ["Limits", "Wired for " + NT + " ticket types, " + NS + " sub-types, " + NF + " statuses, " + NR + " roles. For more sub-types copy the last row of Sub Types down. Keep the Default Status Flow filled from the top with no gaps."],
+    ];
     const ws = {};
-    headers.forEach((h, c) => { ws[XLSX.utils.encode_cell({ r: 0, c })] = { t: "s", v: h }; });
-    for (let r = 1; r <= rowCount; r++) {
-      headers.forEach((_, c) => {
-        const f = cellFor(r + 1, c); // 1-based Excel row number
-        if (f == null) return;
-        ws[XLSX.utils.encode_cell({ r, c })] = { ...F(f), s: helperCols.includes(c) ? HELPER : AUTO_FILL };
-      });
-    }
-    ws["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rowCount, c: headers.length - 1 } });
-    styleSheet(ws, headers.length);
-    autoCols.forEach((c) => { ws[XLSX.utils.encode_cell({ r: 0, c })].s = AUTO_HEAD; });
-    ws["!cols"] = widths.map((wch) => ({ wch }));
-    return ws;
-  };
-  const plain = (headers, widths) => { const ws = XLSX.utils.aoa_to_sheet([headers]); styleSheet(ws, headers.length); ws["!cols"] = widths.map((wch) => ({ wch })); return ws; };
+    const merges = [];
+    const rowsMeta = [];
+    const put = (r, c, v, s) => { ws[XLSX.utils.encode_cell({ r, c })] = { t: "s", v, s }; };
+    const band = (r, c1, c2, s) => { for (let c = c1; c <= c2; c++) put(r, c, "", s); };
+    const wrap = (extra) => ({ alignment: { vertical: "center", wrapText: true }, border: SX_BORDER, font: { sz: 11 }, ...extra });
+    put(0, 0, "Ticket Type Builder — starter sheet", { font: { bold: true, sz: 20, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: SX.navy } }, alignment: { vertical: "center", indent: 1 } });
+    band(0, 1, 7, { fill: { fgColor: { rgb: SX.navy } } });
+    merges.push({ s: { r: 0, c: 0 }, e: { r: 0, c: 7 } }); rowsMeta[0] = { hpt: 44 };
+    put(1, 0, "Type each thing once — everything else fills itself. Work through the tabs from left to right.", { font: { sz: 12, color: { rgb: SX.navy } }, fill: { fgColor: { rgb: SX.paper } }, alignment: { vertical: "center", indent: 1 } });
+    band(1, 1, 7, { fill: { fgColor: { rgb: SX.paper } } });
+    merges.push({ s: { r: 1, c: 0 }, e: { r: 1, c: 7 } }); rowsMeta[1] = { hpt: 26 };
+    // legend
+    put(3, 1, "You type", sxHead(SX.navy)); put(3, 2, "Fills itself", sxHead(SX.green)); put(3, 3, "Optional", sxHead(SX.slate));
+    put(3, 4, "Problem", { ...sxHead("9C0006") }); put(3, 5, "Missing", { ...sxHead(SX.amber) });
+    rowsMeta[3] = { hpt: 24 };
+    let r = 5;
+    put(r - 1, 0, "STEPS", { font: { bold: true, sz: 11, color: { rgb: SX.slate } } }); r += 0;
+    steps.forEach(([n, title, text]) => {
+      put(r, 0, n, { font: { bold: true, sz: 14, color: { rgb: "FFFFFF" } }, fill: { fgColor: { rgb: SX.navy } }, alignment: { horizontal: "center", vertical: "center" }, border: SX_BORDER });
+      put(r, 1, title, wrap({ font: { bold: true, sz: 11, color: { rgb: SX.navy } }, fill: { fgColor: { rgb: SX.paper } } }));
+      put(r, 2, text, wrap({}));
+      band(r, 3, 7, wrap({}));
+      merges.push({ s: { r, c: 2 }, e: { r, c: 7 } });
+      rowsMeta[r] = { hpt: Math.max(30, 17 * Math.ceil(text.length / 105)) };
+      r++;
+    });
+    r++;
+    put(r, 0, "GOOD TO KNOW", { font: { bold: true, sz: 11, color: { rgb: SX.slate } } }); r++;
+    tips.forEach(([title, text]) => {
+      put(r, 0, "•", { alignment: { horizontal: "center", vertical: "center" }, font: { sz: 14, color: { rgb: SX.green }, bold: true } });
+      put(r, 1, title, wrap({ font: { bold: true, sz: 11, color: { rgb: SX.green } }, fill: { fgColor: { rgb: SX.autoBg } } }));
+      put(r, 2, text, wrap({}));
+      band(r, 3, 7, wrap({}));
+      merges.push({ s: { r, c: 2 }, e: { r, c: 7 } });
+      rowsMeta[r] = { hpt: Math.max(30, 17 * Math.ceil(text.length / 105)) };
+      r++;
+    });
+    ws["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: r, c: 7 } });
+    ws["!cols"] = [{ wch: 6 }, { wch: 34 }, { wch: 22 }, { wch: 22 }, { wch: 22 }, { wch: 22 }, { wch: 22 }, { wch: 22 }];
+    ws["!merges"] = merges;
+    ws["!rows"] = rowsMeta;
+    XLSX.utils.book_append_sheet(wb, ws, "Start here");
+    meta["Start here"] = { tab: "E8A33D", noGrid: true };
+  }
 
-  // ---------------- Ticket Details (typed) ----------------
-  XLSX.utils.book_append_sheet(wb, plain(["Ticket Key", "Ticket Type", "Tenant", "Creator Roles", "Viewer Roles", "Assignee Roles", "Prefix (optional)", "Delete"], [20, 22, 14, 26, 32, 26, 26, 10]), "Ticket Details");
+  // ---------------- Roles ----------------
+  {
+    const { ws, meta: m } = sxSheet({
+      headers: ["Role ID  (type once)", "What it is  (optional)", "(for dropdowns)"], kinds: ["type", "optional", "helper"], widths: [26, 44, 22], rows: NR, tab: "7B5EA7", hidden: [2],
+      cellFor: (r, c) => (c === 2 ? (r - 1 <= SX_TOKENS.length ? { v: SX_TOKENS[r - 2] } : `IF($A${r - SX_TOKENS.length}="","",$A${r - SX_TOKENS.length})`) : undefined),
+    });
+    XLSX.utils.book_append_sheet(wb, ws, "Roles"); meta.Roles = m;
+  }
 
-  // ---------------- Sub Types: type A (first row of a group) + B, the rest is formulas ----------------
-  const tdLookup = (col, key) => `INDEX(${TD}!$${col}:$${col},MATCH(${key},${TD}!$A:$A,0))`;
-  const subFormula = (r, c) => {
-    if (c === 0 || c === 1) return null;                                   // A, B typed
-    if (c === 2) return `IF($B${r}="","",$B${r})`;                       // Subtype Key = name
-    if (c === 3) return `IF($B${r}="","",IF(IFERROR(${tdLookup("G", `$H${r}`)}&"","")<>"",${tdLookup("G", `$H${r}`)},"${"$"}{locationId}-"&UPPER(SUBSTITUTE(SUBSTITUTE(SUBSTITUTE($H${r}," ","-"),"(",""),")",""))))`; // Prefix
-    if (c === 4) return `IF($B${r}="","",IFERROR(${tdLookup("F", `$H${r}`)}&"",""))`;   // Assignee roles from the ticket type
-    if (c === 5 || c === 6) return `IF($B${r}="","","No")`;               // Auto Escalation / Delete
-    if (c === 7) return `IF($B${r}="","",$I${r})`;                       // Ticket Key (auto)
-    if (c === 8) return r === 2 ? `IF($A2<>"",$A2,"")` : `IF($A${r}<>"",$A${r},$I${r - 1})`; // carried-down key (helper)
-    return null;
-  };
-  XLSX.utils.book_append_sheet(wb, sheet(["Ticket Key", "Ticket Subtype", "Subtype Key", "Prefix", "Assignee Roles", "Auto Escalation", "Delete", "Ticket Key (auto)", "(helper)"], [20, 32, 28, 28, 28, 16, 10, 20, 12], [2, 3, 4, 5, 6, 7], STARTER_SUBS, subFormula, [8]), "Sub Types");
+  // ---------------- Ticket Details ----------------
+  {
+    const roleDV = (sqref, label) => ({ sqref, formula1: rolesList, errorStyle: "info", prompt: [label, "Pick a role from the list, or type roles separated by commas"] });
+    const { ws, meta: m } = sxSheet({
+      headers: ["Ticket Key", "Ticket Type", "Tenant", "Creator Roles", "Viewer Roles", "Assignee Roles", "Prefix (optional)", "Delete"],
+      kinds: ["type", "optional", "type", "type", "type", "type", "optional", "optional"], widths: [22, 24, 14, 30, 34, 28, 30, 10], rows: NT, freezeCols: 1, tab: "2F5BD2",
+      validations: [
+        { sqref: `A2:A${NT + 1}`, formula1: null, prompt: ["Ticket Key", "Unique code of the ticket type. Type it once."] },
+        { sqref: `B2:B${NT + 1}`, formula1: null, prompt: ["Ticket Type (optional)", "Display name. Leave empty to use the Ticket Key."] },
+        { sqref: `C2:C${NT + 1}`, formula1: null, prompt: ["Tenant", "Type it on the first row; empty rows below use the same tenant."] },
+        roleDV(`D2:D${NT + 1}`, "Creators"), roleDV(`E2:E${NT + 1}`, "Viewers"), roleDV(`F2:F${NT + 1}`, "Assignee roles"),
+        { sqref: `G2:G${NT + 1}`, formula1: null, prompt: ["Prefix (optional)", "Leave empty for ${locationId}-<ticket key>. Or a pattern with {ticketKey} {ticketType} {subType} ({TICKETTYPE} = UPPER CASE)."] },
+        sxYesNo(`H2:H${NT + 1}`, "Delete this ticket type?"),
+      ],
+      conditional: [
+        { sqref: `A2:A${NT + 1}`, formula: `AND($A2<>"",COUNTIF($A$2:$A$${NT + 1},$A2)>1)`, dxf: 0 },
+        { sqref: `D2:D${NT + 1}`, formula: 'AND($A2<>"",$D2="")', dxf: 1 },
+        { sqref: `E2:E${NT + 1}`, formula: 'AND($A2<>"",$E2="")', dxf: 1 },
+        { sqref: `F2:F${NT + 1}`, formula: 'AND($A2<>"",$F2="")', dxf: 1 },
+      ],
+    });
+    XLSX.utils.book_append_sheet(wb, ws, "Ticket Details"); meta["Ticket Details"] = m;
+  }
+
+  // ---------------- Sub Types: type A (pick) + B, the rest is formulas ----------------
+  {
+    const tdLookup = (col, key) => `INDEX(${TD}!$${col}:$${col},MATCH(${key},${TD}!$A:$A,0))`;
+    const san = (x) => `SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(${x}," ","-"),"(",""),")","")`;
+    const cellFor = (r, c) => {
+      if (c === 2) return `IF($B${r}="","",$B${r})`;                                                      // Subtype Key = name
+      if (c === 3) {                                                                                       // Prefix: pattern ($J) with the placeholders filled in
+        let t = `$J${r}`;
+        t = `SUBSTITUTE(${t},"{TICKETKEY}",UPPER(${san(`$H${r}`)}))`;
+        t = `SUBSTITUTE(${t},"{TICKETTYPE}",UPPER(${san(`$K${r}`)}))`;
+        t = `SUBSTITUTE(${t},"{SUBTYPE}",UPPER(${san(`$B${r}`)}))`;
+        t = `SUBSTITUTE(${t},"{ticketKey}",${san(`$H${r}`)})`;
+        t = `SUBSTITUTE(${t},"{ticketType}",${san(`$K${r}`)})`;
+        t = `SUBSTITUTE(${t},"{subType}",${san(`$B${r}`)})`;
+        return `IF($B${r}="","",${t})`;
+      }
+      if (c === 4) return `IF($B${r}="","",IFERROR(${tdLookup("F", `$H${r}`)}&"",""))`;                    // Assignee roles from the ticket type
+      if (c === 5 || c === 6) return `IF($B${r}="","","No")`;                                             // Auto Escalation / Delete
+      if (c === 7) return `IF($B${r}="","",$I${r})`;                                                      // Ticket Key (auto)
+      if (c === 8) return r === 2 ? `IF($A2<>"",$A2,"")` : `IF($A${r}<>"",$A${r},$I${r - 1})`;            // carried-down key (helper)
+      if (c === 9) return `IF($B${r}="","",IF(IFERROR(${tdLookup("G", `$H${r}`)}&"","")<>"",${tdLookup("G", `$H${r}`)},"${"$"}{locationId}-{ticketKey}"))`; // prefix pattern (helper)
+      if (c === 10) return `IF($B${r}="","",IF(IFERROR(${tdLookup("B", `$H${r}`)}&"","")<>"",${tdLookup("B", `$H${r}`)},$H${r}))`;          // ticket type name (helper)
+      return undefined;
+    };
+    const { ws, meta: m } = sxSheet({
+      headers: ["Ticket Key", "Ticket Subtype", "Subtype Key", "Prefix", "Assignee Roles", "Auto Escalation", "Delete", "Ticket Key (auto)", "(helper)", "(helper: prefix pattern)", "(helper: ticket type)"],
+      kinds: ["type", "type", "auto", "auto", "auto", "auto", "auto", "auto", "helper", "helper", "helper"], widths: [22, 34, 30, 30, 30, 16, 10, 20, 12, 26, 18], rows: NS, freezeCols: 2, tab: "2E7D5B", hidden: [8, 9, 10], cellFor,
+      validations: [
+        { sqref: `A2:A${subEnd}`, formula1: keysList, errorStyle: "warning", prompt: ["Ticket Key", "Pick the ticket type — only on the first row of each group, the rows below carry it down."] },
+        { sqref: `B2:B${subEnd}`, formula1: null, prompt: ["Sub-type name", "One sub-type per row. Everything green fills itself."] },
+        sxYesNo(`F2:G${subEnd}`, null),
+      ],
+      conditional: [{ sqref: `A2:A${subEnd} H2:H${subEnd}`, formula: 'AND($B2<>"",COUNTIF(rngKeys,$H2)=0)', dxf: 0 }],
+    });
+    XLSX.utils.book_append_sheet(wb, ws, "Sub Types"); meta["Sub Types"] = m;
+  }
 
   // ---------------- Default Status Flow (typed once) ----------------
-  const flowHeaders = ["Status", "Roles Allowed", "Public", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role"];
-  const flowRows = [
-    ["Open", "", "Yes", "No", "No", "", "", "No", ""],
-    ["In Progress", "<assignee>", "No", "No", "No", "", "", "No", ""],
-    ["Closed", "<assignee>", "No", "No", "Yes", "Closure Remarks", "text", "No", ""],
-    ["Reopen", "<creators>", "No", "No", "Yes", "Reopen Remarks", "text", "No", ""],
-  ];
-  const wsFlow = XLSX.utils.aoa_to_sheet([flowHeaders, ...flowRows]);
-  styleSheet(wsFlow, flowHeaders.length);
-  wsFlow["!cols"] = [26, 30, 10, 18, 18, 26, 16, 20, 26].map((wch) => ({ wch }));
-  wsFlow["!ref"] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: STARTER_STATUSES, c: flowHeaders.length - 1 } });
-  XLSX.utils.book_append_sheet(wb, wsFlow, "Default Status Flow");
+  {
+    const defaults = [
+      ["Open", "", "Yes", "No", "No", "", "", "No", ""],
+      ["In Progress", "<assignee>", "No", "No", "No", "", "", "No", ""],
+      ["Closed", "<assignee>", "No", "No", "Yes", "Closure Remarks", "text", "No", ""],
+      ["Reopen", "<creators>", "No", "No", "Yes", "Reopen Remarks", "text", "No", ""],
+    ];
+    const { ws, meta: m } = sxSheet({
+      headers: ["Status", "Roles Allowed", "Public", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role"],
+      kinds: ["type", "type", "type", "type", "type", "type", "type", "type", "type"], widths: [24, 32, 10, 18, 18, 26, 16, 20, 28], rows: NF, tab: "2F5BD2", headHeight: 48,
+      cellFor: (r, c) => (defaults[r - 2] ? { v: defaults[r - 2][c] } : undefined),
+      validations: [
+        { sqref: `A2:A${flowEnd}`, formula1: null, prompt: ["Status", "Type the status name. Fill from the top, no gaps. Up to " + NF + " statuses."] },
+        { sqref: `B2:B${flowEnd}`, formula1: rolesTokenList, errorStyle: "info", prompt: ["Roles Allowed", "Pick <assignee> / <creators> / <viewers> / a role, or type roles separated by commas."] },
+        sxYesNo(`C2:E${flowEnd}`, null), sxYesNo(`H2:H${flowEnd}`, null),
+        { sqref: `G2:G${flowEnd}`, formula1: '"text,number,date,fileUpload"', errorStyle: "warning", prompt: ["Comment Field Type", "Only used when Mandatory Comments = Yes"] },
+        { sqref: `I2:I${flowEnd}`, formula1: rolesTokenList, errorStyle: "info", prompt: ["New Assignee Role", "Only used when Mandatory New Assignee = Yes"] },
+      ],
+    });
+    XLSX.utils.book_append_sheet(wb, ws, "Default Status Flow"); meta["Default Status Flow"] = m;
+  }
 
   // ---------------- generated: every sub-type x every status of the default flow ----------------
-  const n = `COUNTA(${DF}!$A$2:$A$${flowEnd})`;
-  const rowsTotal = STARTER_SUBS * STARTER_STATUSES;
-  const flowAt = (col, r) => `INDEX(${DF}!$${col}$2:$${col}$${flowEnd},$H${r})&""`;
-  const resolveTokens = (text, r) => {
+  const n = `SUMPRODUCT(--(LEN(${DF}!$A$2:$A$${flowEnd})>0))`;
+  const rowsTotal = NS * NF;
+  const tdLook = (col, key) => `INDEX(${TD}!$${col}:$${col},MATCH(${key},${TD}!$A:$A,0))`;
+  const flowAt = (col, st) => `INDEX(${DF}!$${col}$2:$${col}$${flowEnd},${st})&""`;
+  const resolveTokens = (text, keyCell, subCell) => {
     let t = text;
-    t = `SUBSTITUTE(${t},"<ticket assignee>",IFERROR(${tdLookup("F", `$A${r}`)}&"",""))`;
-    t = `SUBSTITUTE(${t},"<assignee>",INDEX(${ST}!$E$2:$E$${subEnd},$G${r})&"")`;
-    t = `SUBSTITUTE(${t},"<creators>",IFERROR(${tdLookup("D", `$A${r}`)}&"",""))`;
-    t = `SUBSTITUTE(${t},"<viewers>",IFERROR(${tdLookup("E", `$A${r}`)}&"",""))`;
+    t = `SUBSTITUTE(${t},"<ticket assignee>",IFERROR(${tdLook("F", keyCell)}&"",""))`;
+    t = `SUBSTITUTE(${t},"<assignee>",INDEX(${ST}!$E$2:$E$${subEnd},${subCell})&"")`;
+    t = `SUBSTITUTE(${t},"<creators>",IFERROR(${tdLook("D", keyCell)}&"",""))`;
+    t = `SUBSTITUTE(${t},"<viewers>",IFERROR(${tdLook("E", keyCell)}&"",""))`;
     return t;
   };
-  // Status Access Roles: A key | B sub-type | C status | D roles | E public | F (unused spacer) | G sub# | H status#
-  const rolesFormula = (r, c) => {
-    if (c === 6) return `IF(${n}=0,"",IF(INT((ROW()-2)/${n})+1>${STARTER_SUBS},"",IF(INDEX(${ST}!$B$2:$B$${subEnd},INT((ROW()-2)/${n})+1)="","",INT((ROW()-2)/${n})+1)))`;
-    if (c === 7) return `IF($G${r}="","",MOD(ROW()-2,${n})+1)`;
-    const live = `$G${r}<>""`;
-    if (c === 0) return `IF(${live},IF(INDEX(${ST}!$B$2:$B$${subEnd},$G${r})="","",INDEX(${ST}!$H$2:$H$${subEnd},$G${r})),"")`;
-    if (c === 1) return `IF($A${r}="","",INDEX(${ST}!$B$2:$B$${subEnd},$G${r}))`;
-    if (c === 2) return `IF($A${r}="","",INDEX(${DF}!$A$2:$A$${flowEnd},$H${r}))`;
-    if (c === 3) return `IF($A${r}="","",${resolveTokens(flowAt("B", r), r)})`;
-    if (c === 4) return `IF($A${r}="","",${flowAt("C", r)})`;
-    return null;
-  };
-  XLSX.utils.book_append_sheet(wb, sheet(["Ticket Key", "Ticket Subtype", "Status", "Roles Allowed", "Public", "", "Sub #", "Status #"], [20, 32, 22, 34, 10, 3, 8, 9], [0, 1, 2, 3, 4], rowsTotal, rolesFormula, [5, 6, 7]), "Status Access Roles");
+  const subNumber = `IF(${n}=0,"",IF(INT((ROW()-2)/${n})+1>${NS},"",IF(INDEX(${ST}!$B$2:$B$${subEnd},INT((ROW()-2)/${n})+1)="","",INT((ROW()-2)/${n})+1)))`;
+  {
+    // Status Access Roles: A key | B sub-type | C status | D roles | E public | F spacer | G sub# | H status#
+    const cellFor = (r, c) => {
+      if (c === 6) return subNumber;
+      if (c === 7) return `IF($G${r}="","",MOD(ROW()-2,${n})+1)`;
+      const live = `$G${r}<>""`;
+      if (c === 0) return `IF(${live},IF(INDEX(${ST}!$B$2:$B$${subEnd},$G${r})="","",INDEX(${ST}!$H$2:$H$${subEnd},$G${r})),"")`;
+      if (c === 1) return `IF($A${r}="","",INDEX(${ST}!$B$2:$B$${subEnd},$G${r}))`;
+      if (c === 2) return `IF($A${r}="","",INDEX(${DF}!$A$2:$A$${flowEnd},$H${r}))`;
+      if (c === 3) return `IF($A${r}="","",${resolveTokens(flowAt("B", `$H${r}`), `$A${r}`, `$G${r}`)})`;
+      if (c === 4) return `IF($A${r}="","",${flowAt("C", `$H${r}`)})`;
+      return undefined;
+    };
+    const { ws, meta: m } = sxSheet({
+      headers: ["Ticket Key", "Ticket Subtype", "Status", "Roles Allowed", "Public", "", "Sub #", "Status #"],
+      kinds: ["auto", "auto", "auto", "auto", "auto", "helper", "helper", "helper"], widths: [22, 34, 24, 36, 10, 3, 8, 9], rows: rowsTotal, freezeCols: 2, tab: "2E7D5B", hidden: [5, 6, 7], cellFor,
+      conditional: [
+        { sqref: `A2:E${rowsTotal + 1}`, formula: 'AND($G2<>"",MOD($G2,2)=0)', dxf: 2 },
+        { sqref: `A2:E${rowsTotal + 1}`, formula: 'AND($G2<>"",$H2=1)', dxf: 3 },
+      ],
+    });
+    XLSX.utils.book_append_sheet(wb, ws, "Status Access Roles"); meta["Status Access Roles"] = m;
+  }
+  {
+    // Mandate rules: A key | B sub-type | C status | D images | E comments | F label | G type | H new assignee | I role | J spacer | K sub# | L status#
+    const cellFor = (r, c) => {
+      if (c === 10) return subNumber;
+      if (c === 11) return `IF($K${r}="","",MOD(ROW()-2,${n})+1)`;
+      const sub = `$K${r}`, st = `$L${r}`;
+      if (c === 0) return `IF(${sub}<>"",IF(INDEX(${ST}!$B$2:$B$${subEnd},${sub})="","",INDEX(${ST}!$H$2:$H$${subEnd},${sub})),"")`;
+      if (c === 1) return `IF($A${r}="","",INDEX(${ST}!$B$2:$B$${subEnd},${sub}))`;
+      if (c === 2) return `IF($A${r}="","",INDEX(${DF}!$A$2:$A$${flowEnd},${st}))`;
+      if (c >= 3 && c <= 7) return `IF($A${r}="","",${flowAt(String.fromCharCode(65 + c), st)})`;
+      if (c === 8) return `IF($A${r}="","",${resolveTokens(flowAt("I", st), `$A${r}`, sub)})`;
+      return undefined;
+    };
+    const { ws, meta: m } = sxSheet({
+      headers: ["Ticket Key", "Ticket Subtype", "Status", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role", "", "Sub #", "Status #"],
+      kinds: ["auto", "auto", "auto", "auto", "auto", "auto", "auto", "auto", "auto", "helper", "helper", "helper"], widths: [22, 34, 24, 16, 16, 26, 16, 18, 28, 3, 8, 9], rows: rowsTotal, freezeCols: 2, tab: "2E7D5B", hidden: [9, 10, 11], cellFor, headHeight: 48,
+      conditional: [
+        { sqref: `A2:I${rowsTotal + 1}`, formula: 'AND($K2<>"",MOD($K2,2)=0)', dxf: 2 },
+        { sqref: `A2:I${rowsTotal + 1}`, formula: 'AND($K2<>"",$L2=1)', dxf: 3 },
+      ],
+    });
+    XLSX.utils.book_append_sheet(wb, ws, "Mandate rules for status change"); meta["Mandate rules for status change"] = m;
+  }
 
-  // Mandate rules: A key | B sub-type | C status | D images | E comments | F label | G type | H new assignee | I role | J (spacer) | K sub# | L status#
-  const mandHelpSub = "K", mandHelpSt = "L";
-  const mandFormula = (r, c) => {
-    if (c === 10) return `IF(${n}=0,"",IF(INT((ROW()-2)/${n})+1>${STARTER_SUBS},"",IF(INDEX(${ST}!$B$2:$B$${subEnd},INT((ROW()-2)/${n})+1)="","",INT((ROW()-2)/${n})+1)))`;
-    if (c === 11) return `IF($K${r}="","",MOD(ROW()-2,${n})+1)`;
-    const sub = `$${mandHelpSub}${r}`, st = `$${mandHelpSt}${r}`;
-    const at = (col) => `INDEX(${DF}!$${col}$2:$${col}$${flowEnd},${st})&""`;
-    if (c === 0) return `IF(${sub}<>"",IF(INDEX(${ST}!$B$2:$B$${subEnd},${sub})="","",INDEX(${ST}!$H$2:$H$${subEnd},${sub})),"")`;
-    if (c === 1) return `IF($A${r}="","",INDEX(${ST}!$B$2:$B$${subEnd},${sub}))`;
-    if (c === 2) return `IF($A${r}="","",INDEX(${DF}!$A$2:$A$${flowEnd},${st}))`;
-    if (c >= 3 && c <= 7) return `IF($A${r}="","",${at(String.fromCharCode(65 + c))})`;      // D..H straight from the default flow
-    if (c === 8) {
-      let t = at("I");
-      t = `SUBSTITUTE(${t},"<ticket assignee>",IFERROR(${tdLookup("F", `$A${r}`)}&"",""))`;
-      t = `SUBSTITUTE(${t},"<assignee>",INDEX(${ST}!$E$2:$E$${subEnd},${sub})&"")`;
-      t = `SUBSTITUTE(${t},"<creators>",IFERROR(${tdLookup("D", `$A${r}`)}&"",""))`;
-      t = `SUBSTITUTE(${t},"<viewers>",IFERROR(${tdLookup("E", `$A${r}`)}&"",""))`;
-      return `IF($A${r}="","",${t})`;
-    }
-    return null;
-  };
-  XLSX.utils.book_append_sheet(wb, sheet(["Ticket Key", "Ticket Subtype", "Status", "Mandatory Images (Yes/No)", "Mandatory Comments (Yes/No)", "Comment Field Label", "Comment Field Type", "Mandatory New Assignee (Yes/No)", "New Assignee Role", "", "Sub #", "Status #"], [20, 32, 22, 16, 16, 24, 16, 18, 26, 3, 8, 9], [0, 1, 2, 3, 4, 5, 6, 7, 8], rowsTotal, mandFormula, [9, 10, 11]), "Mandate rules for status change");
+  // ---------------- Ticket Structure (custom fields) ----------------
+  {
+    const { ws, meta: m } = sxSheet({
+      headers: ["Ticket Key", "Ticket Subtype", "Field (Type)", "Option / Value", "Mandatory", "Edit Roles"],
+      kinds: ["type", "optional", "type", "type", "optional", "optional"], widths: [22, 34, 34, 44, 12, 34], rows: NFR, freezeCols: 2, tab: "2F5BD2",
+      validations: [
+        { sqref: `A2:A${NFR + 1}`, formula1: keysList, errorStyle: "warning", prompt: ["Ticket Key", "Pick the ticket type (first row of a field; rows below carry it down)"] },
+        { sqref: `B2:B${NFR + 1}`, formula1: subsList, errorStyle: "info", prompt: ["Ticket Subtype", "Empty = the field is added to EVERY sub-type of this ticket type"] },
+        { sqref: `C2:C${NFR + 1}`, formula1: null, prompt: ["Field (Type)", "Write the type in brackets: (Dropdown) (Radio) (Multichoice) (Text) (Number) (Date) (Time) (File). The options go in the rows below."] },
+        sxYesNo(`E2:E${NFR + 1}`, null),
+        { sqref: `F2:F${NFR + 1}`, formula1: rolesList, errorStyle: "info", prompt: ["Edit roles", "Pick a role or type several separated by commas"] },
+      ],
+      conditional: [{ sqref: `A2:A${NFR + 1}`, formula: keyMissing("$A2"), dxf: 0 }],
+    });
+    XLSX.utils.book_append_sheet(wb, ws, "Ticket Structure"); meta["Ticket Structure"] = m;
+  }
 
-  // ---------------- normal typed sheets ----------------
-  XLSX.utils.book_append_sheet(wb, plain(["Ticket Key", "Ticket Subtype", "Field (Type)", "Option / Value", "Mandatory", "Edit Roles"], [20, 30, 30, 40, 12, 30]), "Ticket Structure");
-  XLSX.utils.book_append_sheet(wb, plain(["Ticket Key", "Ticket Subtype", "Status", "Level (1 = first)", "Days", "Assignee Role", "Notification (Yes/No)", "Notification Type", "CC Email Addresses", "Override Status"], [20, 30, 18, 14, 8, 22, 14, 18, 40, 18]), "Escalation details");
+  // ---------------- Escalation details ----------------
+  {
+    const { ws, meta: m } = sxSheet({
+      headers: ["Ticket Key", "Ticket Subtype", "Status", "Level (1 = first)", "Days", "Assignee Role", "Notification (Yes/No)", "Notification Type", "CC Email Addresses", "Override Status"],
+      kinds: ["type", "optional", "type", "optional", "type", "type", "optional", "optional", "optional", "optional"], widths: [22, 34, 20, 14, 8, 26, 16, 18, 40, 20], rows: NER, freezeCols: 2, tab: "2F5BD2", headHeight: 48,
+      validations: [
+        { sqref: `A2:A${NER + 1}`, formula1: keysList, errorStyle: "warning", prompt: ["Ticket Key", "Pick the ticket type"] },
+        { sqref: `B2:B${NER + 1}`, formula1: subsList, errorStyle: "info", prompt: ["Ticket Subtype", "Empty = every sub-type of this ticket type"] },
+        { sqref: `C2:C${NER + 1}`, formula1: statusList, errorStyle: "info", prompt: ["Status", "The status whose tickets escalate"] },
+        { sqref: `D2:D${NER + 1}`, formula1: null, prompt: ["Level", "1 = escalates first. Change the numbers to reorder. Empty = sheet order."] },
+        { sqref: `F2:F${NER + 1}`, formula1: rolesList, errorStyle: "info", prompt: ["Assignee role", "Who the ticket moves to"] },
+        sxYesNo(`G2:G${NER + 1}`, null),
+        { sqref: `H2:H${NER + 1}`, formula1: '"inApp + email,inApp,email"', errorStyle: "warning", prompt: ["Notification type", "Empty = inApp + email"] },
+        { sqref: `J2:J${NER + 1}`, formula1: statusList, errorStyle: "info", prompt: ["Override status", "Optional: status the ticket is set to when this level triggers"] },
+      ],
+      conditional: [{ sqref: `A2:A${NER + 1}`, formula: keyMissing("$A2"), dxf: 0 }],
+    });
+    XLSX.utils.book_append_sheet(wb, ws, "Escalation details"); meta["Escalation details"] = m;
+  }
+
+  wb.Workbook = { Names: NAMES.map(([Name, Ref]) => ({ Name, Ref })) };
+  wb.__starterMeta = meta;
   return wb;
+}
+
+/* ---- XML helpers: SheetJS can't write freeze panes, dropdowns, tab colours or conditional formats, so they are added
+   to the finished .xlsx (a zip) by editing the sheet XML. ---- */
+const xmlEsc = (t) => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function xlsxInject(bytes, metaByName, sheetNames) {
+  const cfb = XLSX.CFB.read(bytes, { type: "array" });
+  const dec = new TextDecoder("utf-8"), enc = new TextEncoder();
+  const idxOf = (re) => cfb.FullPaths.findIndex((p) => re.test(p));
+  const getText = (i) => dec.decode(Uint8Array.from(cfb.FileIndex[i].content));
+  const setText = (i, text) => { const u = enc.encode(text); cfb.FileIndex[i].content = u; cfb.FileIndex[i].size = u.length; };
+  // conditional-format styles
+  const si = idxOf(/xl\/styles\.xml$/);
+  setText(si, getText(si).replace(/<dxfs count="0"\s*\/>/, `<dxfs count="${SX_DXFS.length}">${SX_DXFS.join("")}</dxfs>`));
+  sheetNames.forEach((name, k) => {
+    const meta = metaByName[name];
+    const i = idxOf(new RegExp("xl/worksheets/sheet" + (k + 1) + "\\.xml$"));
+    if (i < 0) return;
+    let xml = getText(i);
+    // truly empty styled cells instead of empty-string cells
+    xml = xml.replace(/<c r="([A-Z]+\d+)"( s="\d+")? t="str"><v><\/v><\/c>/g, '<c r="$1"$2/>').replace(/<c r="([A-Z]+\d+)"( s="\d+")? t="str"><v\/><\/c>/g, '<c r="$1"$2/>');
+    if (meta) {
+      if (meta.tab) xml = xml.replace(/(<worksheet\b[^>]*>)/, `$1<sheetPr><tabColor rgb="FF${meta.tab}"/></sheetPr>`);
+      const grid = meta.noGrid ? ' showGridLines="0"' : "";
+      const f = meta.freeze;
+      let pane = "";
+      if (f && (f.rows || f.cols)) {
+        const tl = XLSX.utils.encode_cell({ r: f.rows || 0, c: f.cols || 0 });
+        const active = f.rows && f.cols ? "bottomRight" : f.rows ? "bottomLeft" : "topRight";
+        pane = `<pane${f.cols ? ` xSplit="${f.cols}"` : ""}${f.rows ? ` ySplit="${f.rows}"` : ""} topLeftCell="${tl}" activePane="${active}" state="frozen"/><selection pane="${active}" activeCell="${tl}" sqref="${tl}"/>`;
+      }
+      xml = xml.replace(/<sheetView\b[^>]*?\/>/, `<sheetView${grid} workbookViewId="0">${pane}</sheetView>`);
+      let extra = "";
+      let prio = 1;
+      (meta.conditional || []).forEach((cf) => {
+        extra += `<conditionalFormatting sqref="${cf.sqref}"><cfRule type="expression" dxfId="${cf.dxf}" priority="${prio++}"><formula>${xmlEsc(cf.formula).replace(/&quot;/g, '"')}</formula></cfRule></conditionalFormatting>`;
+      });
+      if ((meta.validations || []).length) {
+        extra += `<dataValidations count="${meta.validations.length}">`;
+        meta.validations.forEach((v) => {
+          const list = v.formula1 ? ' type="list"' : "";
+          const errStyle = v.errorStyle && v.errorStyle !== "stop" ? ` errorStyle="${v.errorStyle === "info" ? "information" : v.errorStyle}"` : "";
+          const showErr = v.formula1 && v.errorStyle !== "info" ? "1" : "0";
+          const prompt = v.prompt ? ` showInputMessage="1" promptTitle="${xmlEsc(v.prompt[0]).slice(0, 32)}" prompt="${xmlEsc(v.prompt[1]).slice(0, 255)}"` : "";
+          extra += `<dataValidation${list}${errStyle} allowBlank="1"${prompt} showErrorMessage="${showErr}" sqref="${v.sqref}">${v.formula1 ? `<formula1>${xmlEsc(v.formula1).replace(/&quot;/g, '"')}</formula1>` : ""}</dataValidation>`;
+        });
+        extra += "</dataValidations>";
+      }
+      // schema order: ... mergeCells, conditionalFormatting, dataValidations, ... pageMargins, ... ignoredErrors
+      if (extra) {
+        const before = ["<ignoredErrors", "<pageMargins", "</worksheet>"].find((t) => xml.includes(t));
+        xml = xml.replace(before, extra + before);
+      }
+    }
+    setText(i, xml);
+  });
+  return new Uint8Array(XLSX.CFB.write(cfb, { fileType: "zip", type: "array", compression: true }));
+}
+
+/* the finished starter file as bytes (what the app downloads) */
+function excelStarterBytes() {
+  const wb = excelStarterWorkbook();
+  const bytes = XLSX.write(wb, { bookType: "xlsx", type: "array", compression: true });
+  return xlsxInject(new Uint8Array(bytes), wb.__starterMeta, wb.SheetNames);
 }
 
 function excelWorkbookFromDocs(docs) {
@@ -2186,6 +2433,111 @@ function bulkRolesPlan(library, o) {
     return nd;
   });
   const totals = rows.reduce((t, r) => ({ types: t.types + (r.added + r.removed ? 1 : 0), lists: t.lists + r.lists, added: t.added + r.added, removed: t.removed + r.removed, introduced: t.introduced + r.introduced }), { types: 0, lists: 0, added: 0, removed: 0, introduced: 0 });
+  return { library: lib, rows, totals };
+}
+
+/* ---- Prefix shortcuts for the Excel sheet ----
+   A prefix cell (Ticket Details "Prefix", or a sub-type's own Prefix) may contain placeholders that are
+   filled in for every sub-type:  {ticketKey}  {ticketType}  {subType}
+   Written as typed ({ticketType} -> QFS-Fresh); written in capitals ({TICKETTYPE}) the value is UPPER CASE.
+   Spaces / brackets become "-". Example:  ${locationId}-{ticketType}  ->  ${locationId}-QFS-Fresh */
+const prefixPart = (text, upper) => {
+  const t = xnorm(text).replace(/[^A-Za-z0-9&]+/g, "-").replace(/^-+|-+$/g, "");
+  return upper ? t.toUpperCase() : t;
+};
+function renderPrefix(pattern, doc, sub) {
+  const type = doc.ticketType || doc.ticketKey, key = doc.ticketKey || doc.ticketType, subName = sub.ticketType || sub.ticketKey;
+  return String(pattern || "").replace(/\{\s*(ticket\s*type|ticket\s*key|sub\s*-?\s*type)\s*\}/gi, (m, name) => {
+    const letters = m.replace(/[^A-Za-z]/g, "");
+    const n = name.toLowerCase().replace(/[^a-z]/g, "");
+    return prefixPart(n === "tickettype" ? type : n === "ticketkey" ? key : subName, letters === letters.toUpperCase());
+  });
+}
+
+/* ---- Bulk status: add / update / remove ONE status on many sub-types at once ----
+   o: { action: "add"|"update"|"remove", statusText (name or code), newLabel (update: rename),
+        position: "end" | "start" | "after:<code>", onExisting: "skip"|"update" (add),
+        typeUids (null = all), excludeSubIds[],
+        spec: { public, roles[], notify, channels[], notifyRoles, images, commentOn, commentLabel, commentType,
+                newAssigneeOn, newAssigneeRoles[] },
+        groups: { roles, public, notify, mandatory }   (update: which groups to change; add: everything is set) } */
+function bulkStatusPlan(library, o) {
+  const code = toStatusCode(o.statusText);
+  const spec = o.spec || {};
+  const excluded = new Set(o.excludeSubIds || []);
+  const sameText = (a, b) => xnorm(a).toLowerCase() === xnorm(b).toLowerCase();
+  const applySpec = (w, g) => {
+    let n = { ...w };
+    if (g.label && xnorm(o.newLabel)) n.label = xnorm(o.newLabel);
+    if (g.public) n.public = !!spec.public;
+    if (g.roles) { n.roles = [...(spec.roles || [])]; if (spec.notifyRoles) n.notificationRole = [...(spec.roles || [])]; }
+    if (g.notify) { n.notification = !!spec.notify; n.notificationType = spec.notify ? [...(spec.channels || [])] : []; }
+    if (g.mandatory) {
+      let mand = [...(w.mandatoryCustomFields || [])];
+      const fields = [...(w.customFieldsMetaData || [])];
+      const setFlag = (k, on) => { const has = mand.includes(k); if (on && !has) mand.push(k); else if (!on && has) mand = mand.filter((x) => x !== k); }; // keeps the existing order
+      setFlag("images", !!spec.images);
+      setFlag("newAssignee", !!spec.newAssigneeOn);
+      if (spec.newAssigneeOn) n.assigneeRoles = [...(spec.newAssigneeRoles || [])];
+      const lbl = xnorm(spec.commentLabel);
+      const existing = lbl ? fields.find((f) => sameText(f.label, lbl)) : null;
+      if (spec.commentOn) {
+        const useLabel = lbl || "Comments";
+        const f = existing || fieldFromJson({ label: useLabel, key: xToCamelKey(useLabel), type: spec.commentType || "text" });
+        if (!existing) fields.push(f);
+        setFlag(f.key, true);
+      } else if (existing) setFlag(existing.key, false);
+      n.mandatoryCustomFields = mand;
+      n.customFieldsMetaData = fields;
+    }
+    return n;
+  };
+  const all = { label: true, public: true, roles: true, notify: true, mandatory: true };
+  const makeNew = () => applySpec(statusFromJson({
+    status: code, label: xnorm(o.statusText), public: !!spec.public, roles: [], assignee: [], notification: false, notificationType: [],
+    notificationRole: [], mandatoryCustomFields: [], dependentStatus: [], customFieldsMetaData: [], autoEscalationConfig: [],
+  }), { ...all, label: false });
+
+  const rows = [];
+  const lib = library.map((d) => {
+    if (o.typeUids && !o.typeUids.includes(d._uid)) return d;
+    const row = { uid: d._uid, label: d.ticketType || d.ticketKey || "(untitled)", subs: 0, added: 0, updated: 0, removed: 0, skipped: 0, missing: 0 };
+    let touched = false;
+    const subs = d.ticketSubType.map((sub) => {
+      if (excluded.has(sub.id)) return sub;
+      row.subs++;
+      const list = sub.statusWorkFlow;
+      const idx = code ? list.findIndex((w) => toStatusCode(w.status) === code) : -1;
+      let next = list;
+      if (o.action === "add") {
+        if (!code) return sub;
+        if (idx >= 0) {
+          if (o.onExisting === "update") { next = list.map((w, i) => (i === idx ? applySpec(w, all) : w)); row.updated++; }
+          else { row.skipped++; return sub; }
+        } else {
+          const st = makeNew();
+          let at = list.length;
+          if (o.position === "start") at = 0;
+          else if (String(o.position).startsWith("after:")) { const a = list.findIndex((w) => toStatusCode(w.status) === o.position.slice(6)); at = a >= 0 ? a + 1 : list.length; }
+          next = [...list.slice(0, at), st, ...list.slice(at)];
+          row.added++;
+        }
+      } else if (o.action === "update") {
+        if (idx < 0) { row.missing++; return sub; }
+        next = list.map((w, i) => (i === idx ? applySpec(w, { ...o.groups, label: !!xnorm(o.newLabel) }) : w));
+        row.updated++;
+      } else if (o.action === "remove") {
+        if (idx < 0) { row.missing++; return sub; }
+        next = list.filter((_, i) => i !== idx);
+        row.removed++;
+      }
+      touched = true;
+      return { ...sub, statusWorkFlow: next };
+    });
+    rows.push(row);
+    return touched ? { ...d, ticketSubType: subs } : d;
+  });
+  const totals = rows.reduce((t, r) => ({ subs: t.subs + r.subs, added: t.added + r.added, updated: t.updated + r.updated, removed: t.removed + r.removed, skipped: t.skipped + r.skipped, missing: t.missing + r.missing, types: t.types + (r.added + r.updated + r.removed ? 1 : 0) }), { subs: 0, added: 0, updated: 0, removed: 0, skipped: 0, missing: 0, types: 0 });
   return { library: lib, rows, totals };
 }
 
@@ -5174,6 +5526,233 @@ function BulkRolesTab({ library, onApply }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Bulk status                                                         */
+/* ------------------------------------------------------------------ */
+
+function BulkStatusTab({ library, onApply }) {
+  const [action, setAction] = useState("add");
+  const [statusText, setStatusText] = useState("");
+  const [newLabel, setNewLabel] = useState("");
+  const [position, setPosition] = useState("end");
+  const [onExisting, setOnExisting] = useState("skip");
+  const [groups, setGroups] = useState({ roles: true, public: false, notify: false, mandatory: false });
+  const [isPublic, setIsPublic] = useState(false);
+  const [roles, setRoles] = useState([]);
+  const [notifyRoles, setNotifyRoles] = useState(true);
+  const [notify, setNotify] = useState(true);
+  const [channels, setChannels] = useState([...NOTIF_TYPES]);
+  const [images, setImages] = useState(false);
+  const [commentOn, setCommentOn] = useState(false);
+  const [commentLabel, setCommentLabel] = useState("");
+  const [commentType, setCommentType] = useState("text");
+  const [newAssigneeOn, setNewAssigneeOn] = useState(false);
+  const [newAssigneeRoles, setNewAssigneeRoles] = useState([]);
+  const [allTypes, setAllTypes] = useState(true);
+  const [picked, setPicked] = useState([]);
+  const [excludeSubIds, setExcludeSubIds] = useState([]);
+  const [expanded, setExpanded] = useState([]);
+
+  const isAdd = action === "add", isUpdate = action === "update", isRemove = action === "remove";
+  const typeUids = allTypes ? null : picked;
+  const spec = { public: isPublic, roles, notify, channels, notifyRoles, images, commentOn, commentLabel, commentType, newAssigneeOn, newAssigneeRoles };
+  const groupsOn = isAdd ? { roles: true, public: true, notify: true, mandatory: true } : groups;
+
+  // statuses that already exist in the chosen ticket types (click to pick)
+  const found = useMemo(() => {
+    const map = new Map();
+    library.forEach((d) => {
+      if (!allTypes && !picked.includes(d._uid)) return;
+      d.ticketSubType.forEach((sub) => sub.statusWorkFlow.forEach((w) => {
+        const c = toStatusCode(w.status || w.label);
+        if (!c) return;
+        const cur = map.get(c) || { code: c, label: w.label || w.status, count: 0 };
+        cur.count++;
+        map.set(c, cur);
+      }));
+    });
+    return [...map.values()].sort((a, b) => b.count - a.count);
+  }, [library, allTypes, picked]);
+
+  const plan = useMemo(
+    () => bulkStatusPlan(library, { action, statusText, newLabel, position, onExisting, typeUids, excludeSubIds, spec, groups: groupsOn }),
+    [library, action, statusText, newLabel, position, onExisting, allTypes, picked, excludeSubIds, isPublic, roles, notify, channels, notifyRoles, images, commentOn, commentLabel, commentType, newAssigneeOn, newAssigneeRoles, groups], // eslint-disable-line react-hooks/exhaustive-deps
+  );
+  const T = plan.totals;
+  const changes = T.added + T.updated + T.removed;
+  const rowOf = (id) => plan.rows.find((r) => r.uid === id);
+  const code = toStatusCode(statusText);
+  const togglePicked = (id, on) => setPicked((p) => (on ? [...p, id] : p.filter((x) => x !== id)));
+  const toggleSub = (id, on) => setExcludeSubIds((e) => (on ? e.filter((x) => x !== id) : [...e, id]));
+  const toggleExpanded = (id) => setExpanded((e) => (e.includes(id) ? e.filter((x) => x !== id) : [...e, id]));
+  const setGroup = (g, on) => setGroups((x) => ({ ...x, [g]: on }));
+
+  const apply = () => {
+    if (!changes) return;
+    const parts = [T.added ? `add "${statusText.trim()}" to ${T.added} sub-type${T.added === 1 ? "" : "s"}` : "", T.updated ? `update it on ${T.updated}` : "", T.removed ? `remove it from ${T.removed} sub-type${T.removed === 1 ? "" : "s"}` : ""].filter(Boolean);
+    if (!window.confirm(`${parts.join(", ")}.\n\nContinue?`)) return;
+    onApply(plan.library, T, { action, label: statusText.trim() });
+  };
+
+  const group = (id, title, hint, children) => (
+    <div className={`rounded-xl border p-3 ${groupsOn[id] ? "border-white/10 bg-[#111528]" : "border-white/5 bg-[#0D1220] opacity-60"}`}>
+      <div className="mb-2 flex items-center gap-2">
+        {isUpdate && <Checkbox checked={!!groups[id]} onChange={(v) => setGroup(id, v)} title="Change this for the status" />}
+        <span className="text-sm font-semibold text-white">{title}</span>
+        {hint && <span className="text-xs text-white/60">{hint}</span>}
+      </div>
+      <div className={groupsOn[id] ? "" : "pointer-events-none"}>{children}</div>
+    </div>
+  );
+
+  return (
+    <div className="space-y-5">
+      <div className="rounded-xl border border-white/10 bg-[#0D1220] p-4 text-sm text-white">
+        <p className="font-medium mb-1">Add, change or remove one status on many sub-types at once</p>
+        <p className="text-xs text-white/70">Example: add an "Assigned" status between Open and Inprogress on every sub-type, with its roles and a mandatory new assignee. You see what changes before anything is applied.</p>
+      </div>
+
+      <div>
+        <StepTitle n={1} title="What do you want to do?" />
+        <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+          <ChoiceCard selected={isAdd} onClick={() => setAction("add")} title="Add a status" desc="New status on every selected sub-type (skips sub-types that already have it)" />
+          <ChoiceCard selected={isUpdate} onClick={() => setAction("update")} title="Change a status" desc="Change roles, visibility, notifications or mandatory rules of an existing status" />
+          <ChoiceCard selected={isRemove} onClick={() => setAction("remove")} tone="danger" title="Remove a status" desc="Take the status out of every selected sub-type" />
+        </div>
+      </div>
+
+      <div>
+        <StepTitle n={2} title={isAdd ? "Name of the new status" : "Which status?"} hint={isAdd ? "The status code is made from the name (lowercase, no spaces)" : "Pick one that exists, or type its name / code"} />
+        <Input value={statusText} onChange={setStatusText} placeholder={isAdd ? "Assigned" : "inprogress"} />
+        {code && <p className="mt-1 text-xs text-white/60">Code: <span className="font-mono">{code}</span></p>}
+        {!isAdd && found.length > 0 && (
+          <div className="mt-2 flex flex-wrap items-center gap-1.5">
+            <span className="text-xs text-white/60">In these ticket types:</span>
+            {found.map((st) => (
+              <button key={st.code} type="button" onClick={() => setStatusText(st.label || st.code)}
+                className={`rounded-full border px-2.5 py-0.5 text-xs ${code === st.code ? "border-indigo-400 bg-indigo-500/20 text-indigo-100" : "border-white/10 text-white/80 hover:border-white/30"}`}>
+                {st.label || st.code} <span className="text-white/50">· {st.count}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        {isUpdate && (
+          <div className="mt-3 max-w-md"><Label hint="Optional: rename the status label (the code stays the same)">New label</Label><Input value={newLabel} onChange={setNewLabel} placeholder="" /></div>
+        )}
+      </div>
+
+      {isAdd && (
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          <div>
+            <Label>Where in the flow?</Label>
+            <select value={position} onChange={(e) => setPosition(e.target.value)} className="w-full rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-2 text-sm text-white outline-none focus:border-indigo-400">
+              <option value="end">At the end</option>
+              <option value="start">At the beginning</option>
+              {found.map((st) => <option key={st.code} value={"after:" + st.code}>After "{st.label || st.code}"</option>)}
+            </select>
+          </div>
+          <div>
+            <Label>If a sub-type already has this status</Label>
+            <select value={onExisting} onChange={(e) => setOnExisting(e.target.value)} className="w-full rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-2 text-sm text-white outline-none focus:border-indigo-400">
+              <option value="skip">Leave it as it is</option>
+              <option value="update">Overwrite it with these settings</option>
+            </select>
+          </div>
+        </div>
+      )}
+
+      {!isRemove && (
+        <div>
+          <StepTitle n={3} title="Settings" hint={isUpdate ? "Tick a box to change that part; unticked parts stay as they are" : "Everything below is set on the new status"} />
+          <div className="space-y-3">
+            {group("roles", "Who can use the status", "roles allowed to view / move it", <>
+              <TagInput values={roles} onChange={setRoles} placeholder="corpadmin" tone="indigo" />
+              <label className="mt-2 flex cursor-pointer items-center gap-2 text-xs text-white"><Checkbox checked={notifyRoles} onChange={setNotifyRoles} />Notify the same roles (notification roles)</label>
+            </>)}
+            {group("public", "Visible to viewers (public)", "", <>
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-white"><Checkbox checked={isPublic} onChange={setIsPublic} />Public</label>
+            </>)}
+            {group("notify", "Notifications", "", <>
+              <label className="mb-2 flex cursor-pointer items-center gap-2 text-sm text-white"><Checkbox checked={notify} onChange={setNotify} />Send notifications</label>
+              {notify && <CheckChips options={NOTIF_TYPES} values={channels} onChange={setChannels} />}
+            </>)}
+            {group("mandatory", "Mandatory when a ticket moves to this status", "", <>
+              <div className="space-y-2 text-sm text-white">
+                <label className="flex cursor-pointer items-center gap-2"><Checkbox checked={images} onChange={setImages} />Images are mandatory</label>
+                <label className="flex cursor-pointer items-center gap-2"><Checkbox checked={commentOn} onChange={setCommentOn} />A comment / remarks field is mandatory</label>
+                {commentOn && (
+                  <div className="ml-6 grid grid-cols-1 gap-2 md:grid-cols-2">
+                    <Input value={commentLabel} onChange={setCommentLabel} placeholder="Action Taken" />
+                    <select value={commentType} onChange={(e) => setCommentType(e.target.value)} className="rounded-md border border-white/10 bg-[#0B0F1C] px-2 py-2 text-sm text-white outline-none focus:border-indigo-400">
+                      <option value="text">text</option><option value="number">number</option><option value="date">date</option>
+                    </select>
+                  </div>
+                )}
+                <label className="flex cursor-pointer items-center gap-2"><Checkbox checked={newAssigneeOn} onChange={setNewAssigneeOn} />A new assignee must be chosen</label>
+                {newAssigneeOn && <div className="ml-6"><TagInput values={newAssigneeRoles} onChange={setNewAssigneeRoles} placeholder="role the new assignee can have, e.g. projectmanager" tone="indigo" /></div>}
+              </div>
+            </>)}
+          </div>
+        </div>
+      )}
+
+      <div>
+        <StepTitle n={isRemove ? 3 : 4} title="Which ticket types?" hint="Open a ticket type to leave out individual sub-types" />
+        <div className="rounded-xl border border-white/10 bg-[#111528] p-3">
+          <label className="flex cursor-pointer items-center gap-2 text-sm text-white">
+            <Checkbox checked={allTypes} onChange={setAllTypes} title="Every ticket type" />All ticket types ({library.length})
+          </label>
+        </div>
+        <div className="mt-2 divide-y divide-white/5 rounded-xl border border-white/10 bg-[#111528]">
+          {library.length === 0 && <p className="p-3 text-xs text-white/70">No ticket types loaded yet.</p>}
+          {library.map((d) => {
+            const on = allTypes || picked.includes(d._uid);
+            const r = rowOf(d._uid);
+            const open = expanded.includes(d._uid);
+            return (
+              <div key={d._uid}>
+                <div className="flex items-center gap-3 px-3 py-2">
+                  <Checkbox checked={on} disabled={allTypes} onChange={(v) => togglePicked(d._uid, v)} title="Include this ticket type" />
+                  <button type="button" onClick={() => toggleExpanded(d._uid)} className="text-white/70 hover:text-white">{open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}</button>
+                  <span className="min-w-0 flex-1 truncate text-sm text-white">{d.ticketType || d.ticketKey || "(untitled)"}<span className="ml-2 text-xs text-white/50">{d.ticketSubType.length} sub-types</span></span>
+                  {on && r && code && (
+                    <span className="text-xs">
+                      {r.added > 0 && <span className="text-emerald-300">+{r.added} added</span>}
+                      {r.updated > 0 && <span className="ml-2 text-sky-300">{r.updated} changed</span>}
+                      {r.removed > 0 && <span className="ml-2 text-rose-300">−{r.removed} removed</span>}
+                      {r.skipped > 0 && <span className="ml-2 text-white/50">{r.skipped} already have it</span>}
+                      {r.missing > 0 && <span className="ml-2 text-amber-300">{r.missing} don't have it</span>}
+                    </span>
+                  )}
+                </div>
+                {open && (
+                  <div className="grid grid-cols-1 gap-x-4 gap-y-1 border-t border-white/5 bg-[#0D1220] px-10 py-2 md:grid-cols-2">
+                    {d.ticketSubType.map((sub) => (
+                      <label key={sub.id} className="flex cursor-pointer items-center gap-2 text-xs text-white">
+                        <Checkbox checked={!excludeSubIds.includes(sub.id)} onChange={(v) => toggleSub(sub.id, v)} title="Include this sub-type" />
+                        <span className="truncate">{sub.ticketType || sub.ticketKey}</span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-sm text-white">
+          {!code ? "Enter the status first" : changes
+            ? [T.added ? `${T.added} to add` : "", T.updated ? `${T.updated} to change` : "", T.removed ? `${T.removed} to remove` : ""].filter(Boolean).join(" · ") + `, across ${T.types} ticket type${T.types === 1 ? "" : "s"}`
+            : "Nothing to change yet"}
+        </span>
+        <div className="ml-auto"><Btn variant={isRemove ? "danger" : "accent"} onClick={apply}><Check size={15} />{isAdd ? "Add status" : isUpdate ? "Apply changes" : "Remove status"}</Btn></div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* App                                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -5629,8 +6208,14 @@ export default function App({ initialData } = {}) {
   };
 
   const downloadStarterSheet = () => {
-    XLSX.writeFile(excelStarterWorkbook(), "ticket-types-starter.xlsx", { compression: true });
-    showToast({ type: "info", title: "Starter sheet downloaded", lines: ["Type the ticket types, then one sub-type per row. The green columns (keys, prefixes, assignees, status flow for every sub-type) fill themselves in Excel — then import the saved file."] });
+    const blob = new Blob([excelStarterBytes()], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "ticket-types-starter.xlsx";
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast({ type: "info", title: "Starter sheet downloaded", lines: ["Follow the 'Start here' tab: list the roles, type the ticket types, pick the ticket key and type one sub-type per row. Green cells fill themselves — then save and import the file."] });
   };
 
   const exportSelectedToExcel = () => {
@@ -5961,6 +6546,12 @@ export default function App({ initialData } = {}) {
     });
   };
 
+  const applyBulkStatus = (nextLibrary, totals, info) => {
+    setLibrary(nextLibrary);
+    const parts = [totals.added ? `${totals.added} added` : "", totals.updated ? `${totals.updated} changed` : "", totals.removed ? `${totals.removed} removed` : ""].filter(Boolean).join(", ");
+    showToast({ type: "success", title: `Status "${info.label}" updated`, lines: [`${parts} across ${totals.types} ticket type${totals.types === 1 ? "" : "s"}.`] });
+  };
+
   const nav = [
     { id: "library", label: `Ticket Types (${library.length})`, icon: <ListTree size={16} /> },
     { id: "templates", label: `Templates (${templates.length})`, icon: <LayoutTemplate size={16} /> },
@@ -5968,6 +6559,7 @@ export default function App({ initialData } = {}) {
     { id: "bulkesc", label: "Bulk Escalation", icon: <AlertTriangle size={16} /> },
     { id: "bulkmand", label: "Bulk Mandatory", icon: <ShieldCheck size={16} /> },
     { id: "bulkroles", label: "Bulk Roles", icon: <Users size={16} /> },
+    { id: "bulkstatus", label: "Bulk Status", icon: <Workflow size={16} /> },
     { id: "details", label: "Details", icon: <Ticket size={16} /> },
     { id: "roles", label: "Roles", icon: <Users size={16} /> },
     { id: "subtypes", label: `Sub-Types (${selected ? selected.ticketSubType.length : 0})`, icon: <ListTree size={16} /> },
@@ -5997,7 +6589,7 @@ export default function App({ initialData } = {}) {
         </div>
         <nav className="flex-1 px-2 py-4 space-y-1">
           {nav.map((n) => {
-            const disabled = n.id !== "library" && n.id !== "templates" && n.id !== "smartupdate" && n.id !== "bulkesc" && n.id !== "bulkmand" && n.id !== "bulkroles" && !selected;
+            const disabled = n.id !== "library" && n.id !== "templates" && n.id !== "smartupdate" && n.id !== "bulkesc" && n.id !== "bulkmand" && n.id !== "bulkroles" && n.id !== "bulkstatus" && !selected;
             return (
               <button
                 key={n.id}
@@ -6026,10 +6618,10 @@ export default function App({ initialData } = {}) {
         <header className="bg-[#0A0E1C] border-b border-white/10 px-8 py-4 flex items-center justify-between gap-4">
           <div className="min-w-0">
             <h1 className="text-base font-semibold text-white truncate">
-              {tab === "library" ? "All ticket types" : tab === "templates" ? "Sub-type templates" : tab === "smartupdate" ? "Smart update" : tab === "bulkesc" ? "Bulk escalation" : tab === "bulkmand" ? "Bulk mandatory fields" : tab === "bulkroles" ? "Bulk roles" : (selected ? (selected.ticketType || "Untitled ticket type") : "No ticket type selected")}
+              {tab === "library" ? "All ticket types" : tab === "templates" ? "Sub-type templates" : tab === "smartupdate" ? "Smart update" : tab === "bulkesc" ? "Bulk escalation" : tab === "bulkmand" ? "Bulk mandatory fields" : tab === "bulkroles" ? "Bulk roles" : tab === "bulkstatus" ? "Bulk status" : (selected ? (selected.ticketType || "Untitled ticket type") : "No ticket type selected")}
             </h1>
             <p className="text-xs font-mono text-white">
-              {tab === "library" ? `${library.length} loaded` : tab === "templates" ? `${templates.length} template${templates.length === 1 ? "" : "s"} available for bulk creation` : tab === "smartupdate" ? "describe changes, review the diff, then apply" : tab === "bulkesc" ? "bulk-add escalation levels" : tab === "bulkmand" ? "require fields when a status is reached" : tab === "bulkroles" ? "roles in bulk" : (selected ? (selected.ticketKey || "no key set yet") : "pick one from Ticket Types")}
+              {tab === "library" ? `${library.length} loaded` : tab === "templates" ? `${templates.length} template${templates.length === 1 ? "" : "s"} available for bulk creation` : tab === "smartupdate" ? "describe changes, review the diff, then apply" : tab === "bulkesc" ? "bulk-add escalation levels" : tab === "bulkmand" ? "require fields when a status is reached" : tab === "bulkroles" ? "roles in bulk" : tab === "bulkstatus" ? "statuses in bulk" : (selected ? (selected.ticketKey || "no key set yet") : "pick one from Ticket Types")}
             </p>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -6074,7 +6666,7 @@ export default function App({ initialData } = {}) {
           </div>
         )}
 
-        <div className={(tab === "library" || tab === "templates" || tab === "smartupdate" || tab === "bulkesc" || tab === "bulkmand" || tab === "bulkroles") ? "px-8 py-6" : "px-8 py-6 max-w-4xl"}>
+        <div className={(tab === "library" || tab === "templates" || tab === "smartupdate" || tab === "bulkesc" || tab === "bulkmand" || tab === "bulkroles" || tab === "bulkstatus") ? "px-8 py-6" : "px-8 py-6 max-w-4xl"}>
           {tab === "library" && (
             <LibraryTab
               library={library}
@@ -6110,6 +6702,7 @@ export default function App({ initialData } = {}) {
           {tab === "bulkesc" && <BulkEscalationTab library={library} onApply={applyBulkEscalation} />}
           {tab === "bulkmand" && <BulkMandatoryTab library={library} onApply={applyBulkMandatory} />}
           {tab === "bulkroles" && <BulkRolesTab library={library} onApply={applyBulkRoles} />}
+          {tab === "bulkstatus" && <BulkStatusTab library={library} onApply={applyBulkStatus} />}
           {tab === "details" && selected && <DetailsTab doc={selected} onChange={updateSelected} />}
           {tab === "roles" && selected && <RolesTab doc={selected} onChange={updateSelected} />}
           {tab === "subtypes" && selected && (
